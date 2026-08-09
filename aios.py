@@ -2138,7 +2138,15 @@ def _openclaw_os_url(cfg) -> str | None:
     return cfg_get(cfg, "health.openclaw_os", f"http://127.0.0.1:{port}/plugins/openclawos/")
 
 
+def _is_docker() -> bool:
+    """Must be checked before _is_wsl(): Docker Desktop runs on the WSL2 kernel, so
+    /proc/version says "microsoft" inside a container too."""
+    return (os.environ.get("AIOS_IN_DOCKER") == "1" or Path("/.dockerenv").exists())
+
+
 def _is_wsl() -> bool:
+    if _is_docker():
+        return False
     try:
         return "microsoft" in Path("/proc/version").read_text(errors="ignore").lower()
     except Exception:
@@ -2159,7 +2167,14 @@ def _print_urls(cfg):
     q = f"?token={tok}" if tok else ""
     say(f"{C.B}★ Control Room — talk to everything{C.R}")
     say(f"  {C.CYN}http://127.0.0.1:{hbp}/{C.R}   (the AIOS Hub dashboard)")
-    if _is_wsl():
+    if _is_docker():
+        # Ports are published to the host, so localhost is right — but the request
+        # arrives from the bridge, which isn't loopback, so it needs the token.
+        say(f"  {C.B}{C.YEL}Docker → open this on your host: "
+            f"http://localhost:{hbp}/{q}{C.R}")
+        if not tok:
+            say(f"  {C.GRY}(run `aios token` inside the container for the token){C.R}")
+    elif _is_wsl():
         ip = _wsl_ip()
         if ip:
             # A WSL-IP request is non-loopback, so it MUST carry the token — the browser

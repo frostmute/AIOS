@@ -1326,6 +1326,41 @@ def services_status() -> dict:
 # --------------------------------------------------------------------------- #
 # HTTP server                                                                  #
 # --------------------------------------------------------------------------- #
+# Shown when a browser reaches the hub without a token — which is the normal first
+# experience in Docker or over a LAN, since only loopback is trusted.
+UNLOCK_PAGE = """<!doctype html><meta charset="utf-8">
+<title>The AI OS — token required</title>
+<style>
+ :root{color-scheme:dark}
+ body{margin:0;min-height:100vh;display:grid;place-items:center;background:#15120c;
+      color:#f0e8d6;font:15px/1.6 system-ui,-apple-system,Segoe UI,Roboto,sans-serif}
+ .card{max-width:520px;padding:34px;border:1px solid #33291d;border-radius:14px;background:#1c1811}
+ h1{margin:0 0 6px;font-size:1.35rem;color:#caa63f}
+ p{color:#bcac8f;margin:.6em 0}
+ code,kbd{background:#100d08;border:1px solid #33291d;border-radius:6px;padding:2px 6px;
+      font-family:ui-monospace,Consolas,monospace;font-size:.86em;color:#f0e8d6}
+ form{display:flex;gap:8px;margin-top:18px}
+ input{flex:1;background:#221c14;border:1px solid #4a3c29;border-radius:9px;padding:11px;
+      color:#f0e8d6;font-family:ui-monospace,Consolas,monospace}
+ button{background:#caa63f;color:#1a1408;border:0;border-radius:9px;padding:11px 20px;
+      font-weight:700;cursor:pointer}
+ .hint{font-size:.85rem;color:#8a7c62;margin-top:16px}
+</style>
+<div class="card">
+  <h1>🔒 The AI OS — token required</h1>
+  <p>You reached the hub from outside <code>localhost</code>, so it needs the access
+     token. This is deliberate: the agents have full control of this machine, so the
+     control plane is never open.</p>
+  <form onsubmit="location='/?token='+encodeURIComponent(this.t.value.trim());return false">
+    <input name="t" placeholder="aios_…" autofocus spellcheck="false">
+    <button>Unlock</button>
+  </form>
+  <p class="hint">Find it with <code>aios token</code> — or in Docker:<br>
+     <code>docker compose exec aios aios token</code><br>
+     It's also printed in <code>docker compose logs</code> on first boot.</p>
+</div>"""
+
+
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, *a):
         pass  # quiet; aios captures stdout separately
@@ -1355,7 +1390,14 @@ class Handler(BaseHTTPRequestHandler):
         if not ok:
             brain.audit("http", "denied", f"{self.command} {self.path.split('?')[0]} "
                                           f"from {self.client_address[0]}: {why}", ok=False)
-            self._send(401, {"error": "unauthorized", "reason": why})
+            # A person typing http://host:8787 in a browser gets a page they can act
+            # on, not raw JSON. Common in Docker/LAN, where the request arrives from
+            # a bridge IP and is correctly non-loopback.
+            wants_html = "text/html" in (self.headers.get("Accept") or "")
+            if wants_html and self.command == "GET":
+                self._send(401, UNLOCK_PAGE, "text/html; charset=utf-8")
+            else:
+                self._send(401, {"error": "unauthorized", "reason": why})
         return ok
 
     def do_OPTIONS(self):
