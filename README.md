@@ -117,37 +117,47 @@ aios url                 # open the Control Room
 | **claude-code** | Claude Code as an OpenAI-compatible API | `8000` | [codingworkflow/claude-code-api](https://github.com/codingworkflow/claude-code-api) |
 | **LifeOS** | Shared identity + skills mounted into the agents | — | [danielmiessler/LifeOS](https://github.com/danielmiessler/LifeOS) |
 
-Plus two integrations that glue it together:
+Plus the integrations that glue it together — these aren't services, they're mounted into every agent:
 
 | | Role | Upstream |
 |---|---|---|
 | **AIOS Hub** | The Control Room — unified dashboard + interconnect (`:8787`) | *(this repo)* |
 | **openclaw-os** | openclaw's generative-UI **dashboard** (a plugin, not an agent) | [thesys](https://github.com/thesysdev/openclaw-os) |
 | **OpenUI** | Generative-UI standard, mounted into every agent | [openui.com](https://www.openui.com) |
+| **Fabric** | **255 task patterns** run on your own model — `summarize`, `extract_wisdom`, … | [danielmiessler/fabric](https://github.com/danielmiessler/fabric) |
+| **Caveman** | Conciseness mode — ~65% fewer output tokens, accuracy kept | [JuliusBrussee/caveman](https://github.com/JuliusBrussee/caveman) |
+| **Ponytail** | Laziness mode — ~54% less code, YAGNI enforced | [DietrichGebert/ponytail](https://github.com/DietrichGebert/ponytail) |
+| **Ruflo** | Agent meta-harness — swarms, 314+ MCP tools, 30+ plugins | [ruvnet/ruflo](https://github.com/ruvnet/ruflo) |
 
 ## 🗺️ Architecture
 
 ```
-                    ┌──────────────────────────────────────────────┐
-                    │   💬  AIOS Hub — the Control Room  :8787      │  talk to everything
-                    │   chat · broadcast · live status · interconnect
-                    └───────┬───────────┬───────────┬──────────┬────┘
-              ┌─────────────┘     ┌─────┘       ┌───┘      ┌───┘
-     ┌────────▼───────┐  ┌────────▼──────┐  ┌───▼──────┐  ┌▼──────────────┐
-     │ opencode :4096 │  │ hermes  :9119 │  │ openclaw │  │ CrewAI  :4788 │
-     │ coding engine  │  │ autonomous    │  │  :18789  │  │ multi-agent   │
-     └────────────────┘  └───────────────┘  └────┬─────┘  └───────────────┘
-            every agent gets every other's URL   │  hosts
-            (agents call each other via the Hub) │
-                                        ┌─────────▼──────────┐
-                                        │ openclaw-os (OpenUI) │  dashboard
-                                        └──────────────────────┘
-     ┌──────────────────────────────────────────────────────────────────┐
-     │ LifeOS skills + OpenUI context — mounted into every agent          │
-     └──────────────────────────────────────────────────────────────────┘
+        ┌────────────────────────────────────────────────────────────────────┐
+        │  💬  AIOS Hub — the Control Room  :8787                             │
+        │  chat · canvas · task brain · taskflow · updates · audit · REST API │
+        └──┬────────┬────────────┬────────────┬────────────┬─────────────────┘
+           │        │            │            │            │   agents reach each other
+   ┌───────▼──┐ ┌───▼──────┐ ┌───▼──────┐ ┌───▼──────┐ ┌───▼─────────┐  through the Hub
+   │ opencode │ │ hermes   │ │ openclaw │ │ CrewAI   │ │ claude-code │
+   │  :4096   │ │  :9119   │ │  :18789  │ │  :4788   │ │   :8000     │
+   │ coding   │ │autonomous│ │28 channels│ │  crews   │ │ your Claude │
+   └──────────┘ └────┬─────┘ └────┬─────┘ └──────────┘ │subscription │
+                     │            │ hosts              └─────────────┘
+              ┌──────▼────────────▼──────┐
+              │ embed proxies :8791/:8792│  so their UIs render inside the Hub
+              └──────────┬───────────────┘
+                    ┌────▼─────────────────┐
+                    │ openclaw-os (OpenUI) │  generative-UI dashboard
+                    └──────────────────────┘
+   ┌────────────────────────────────────────────────────────────────────────┐
+   │ Mounted into EVERY agent — not services:                               │
+   │  LifeOS skills · OpenUI context · Fabric (255 patterns)                │
+   │  Caveman (say less) · Ponytail (build less) · Ruflo (swarms, MCP)      │
+   └────────────────────────────────────────────────────────────────────────┘
 
-  Single source of truth:  aios.config.yaml  +  .env   →  rendered into each project's config
-  Single control surface:  ./aios <command>            →  state kept under .aios/
+  Single source of truth:  aios.config.yaml + .env  →  rendered into each project
+  Single control surface:  aios <command>           →  state in .aios/aios.db
+  Or run the whole thing:  docker compose up -d
 ```
 
 ## ✨ What you get
@@ -173,7 +183,8 @@ Plus two integrations that glue it together:
 | `aios restart [svc…\|all]` | Force a clean respawn (picks up new code after an update). `aios update` does this automatically. |
 | `aios status` | Table of each service: state, port, PID, health. |
 | `aios doctor` | Diagnose tools, config, deps and ports — with the exact fix for each. |
-| `aios update [--check]` | `git pull` + reinstall changed deps + re-render. `--check` just reports if updates exist (also auto-checked on start). |
+| `aios update [--check]` | `git pull` + reinstall changed deps + re-render + re-mount skills. `--check` just reports if updates exist (also auto-checked on start). |
+| `aios updates [--apply P]` | **Supervised** upstream updates — an agent reviews the commits and returns SAFE/RISKY/BLOCK before anything is applied; `--rollback P` restores a previous version. |
 | `aios autostart enable\|disable` | Run The AI OS on login/boot (Startup shortcut on Windows, systemd/`.bashrc` on Linux/WSL). |
 | `aios exec <cmd>` | Run a command through the agents' own **guardrailed, audited** shell. |
 | `aios channels` | List the **28 messaging channels** the gateway can bridge, and which are configured. |
