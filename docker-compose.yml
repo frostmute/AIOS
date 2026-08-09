@@ -15,15 +15,20 @@ services:
     image: ghcr.io/zdstudios/aios:latest
     container_name: aios
     restart: unless-stopped
+    # Only the Control Room is published. The services all talk to each other
+    # inside the container, so publishing the rest just invites port collisions —
+    # notably with a native `aios start` on the same machine, which already owns
+    # 4096/9119/18789/4788/8000. Uncomment any you genuinely need from the host,
+    # or change the left-hand (host) number to avoid a clash.
     ports:
-      - "8787:8787"      # ★ Control Room (the only one you normally need)
-      - "4096:4096"      # opencode
-      - "9119:9119"      # hermes
-      - "18789:18789"    # openclaw gateway (+ openclaw-os dashboard)
-      - "4788:4788"      # CrewAI
-      - "8000:8000"      # claude-code API
-      - "8791:8791"      # openclaw embed proxy
-      - "8792:8792"      # hermes embed proxy
+      - "${AIOS_PORT:-8787}:8787"   # ★ Control Room — the only one you normally need
+      # - "4096:4096"      # opencode API
+      # - "9119:9119"      # hermes dashboard
+      # - "18789:18789"    # openclaw gateway (+ openclaw-os dashboard)
+      # - "4788:4788"      # CrewAI API
+      # - "8000:8000"      # claude-code API (OpenAI-compatible)
+      # - "8791:8791"      # openclaw embed proxy
+      # - "8792:8792"      # hermes embed proxy
     environment:
       # One provider key powers every agent. Leave blank and use your Claude
       # subscription instead (docker compose exec aios aios claude-login).
