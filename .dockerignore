@@ -1,0 +1,39 @@
+# The repo carries nine vendored projects; without this the build context is
+# gigabytes of node_modules and git history that the image rebuilds anyway.
+.git
+**/.git
+**/node_modules
+**/.venv
+**/venv
+**/__pycache__
+**/*.pyc
+**/.pytest_cache
+**/.mypy_cache
+**/.ruff_cache
+**/dist
+**/build
+**/.next
+**/.turbo
+**/target
+
+# Local state and secrets — mounted at runtime, never baked into the image.
+.aios/
+.env
+*.env
+!.env.example
+aios.config.yaml
+
+# Host-specific junk
+.claude/
+.vscode/
+.idea/
+*.log
+*.zip
+*.tar.gz
+Thumbs.db
+.DS_Store
+
+# Docs/media that don't affect the runtime
+docs/aios/inventory.md
+**/*.gif
+**/*.mp4

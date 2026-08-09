@@ -66,6 +66,16 @@ curl -fsSL https://raw.githubusercontent.com/ZDStudios/AIOS/main/install.sh | ba
 irm https://raw.githubusercontent.com/ZDStudios/AIOS/main/install.ps1 | iex
 ```
 
+**Docker** — no toolchains on your machine, and the agents' full control is scoped to a container you can delete:
+
+```bash
+git clone https://github.com/ZDStudios/AIOS.git && cd AIOS
+cp .env.example .env          # add a model key, or use your Claude subscription
+docker compose up -d --build  # then open http://localhost:8787
+```
+
+Full guide: **[docs/DOCKER.md](docs/DOCKER.md)**.
+
 The installer **asks for root once, up front** (sudo on Linux/macOS, a UAC prompt on Windows) — because
 the agents get full control of the machine and setup registers a start-on-boot service and a global
 `aios` command. It then clones the repo to `~/AIOS`, installs the toolchains (**uv, bun, pnpm, Node**)

@@ -1,0 +1,62 @@
+# The AI OS — one container, nine AI projects.
+#
+#   docker compose up -d --build      build and start
+#   docker compose logs -f            watch it come up (first boot takes a while)
+#   docker compose exec aios aios status
+#   docker compose exec aios aios claude-login    use your Claude subscription
+#
+# Then open http://localhost:8787 — the token is printed in the logs.
+
+services:
+  aios:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: ghcr.io/zdstudios/aios:latest
+    container_name: aios
+    restart: unless-stopped
+    ports:
+      - "8787:8787"      # ★ Control Room (the only one you normally need)
+      - "4096:4096"      # opencode
+      - "9119:9119"      # hermes
+      - "18789:18789"    # openclaw gateway (+ openclaw-os dashboard)
+      - "4788:4788"      # CrewAI
+      - "8000:8000"      # claude-code API
+      - "8791:8791"      # openclaw embed proxy
+      - "8792:8792"      # hermes embed proxy
+    environment:
+      # One provider key powers every agent. Leave blank and use your Claude
+      # subscription instead (docker compose exec aios aios claude-login).
+      AIOS_LLM_PROVIDER: "${AIOS_LLM_PROVIDER:-openrouter}"
+      AIOS_LLM_API_KEY: "${AIOS_LLM_API_KEY:-}"
+      AIOS_DEFAULT_MODEL: "${AIOS_DEFAULT_MODEL:-anthropic/claude-opus-4.6}"
+      # Raises the GitHub API limit for supervised updates (60/hr -> 5000/hr).
+      GITHUB_TOKEN: "${GITHUB_TOKEN:-}"
+      AIOS_HUB_HOST: "0.0.0.0"
+    volumes:
+      # Durable state: memory, tasks, flows, audit log, pidfiles, logs.
+      - aios-state:/aios/.aios
+      # Secrets + config on the host, so rebuilds don't lose them.
+      - ./.env:/aios/.env
+      - ./aios.config.yaml:/aios/aios.config.yaml
+      # Your Claude CLI login, so the claude-code service is authenticated.
+      # Comment this out if you'd rather log in inside the container.
+      - ${HOME:-~}/.claude:/root/.claude
+    # Agents get full control of this container. That's the point — and the
+    # container boundary is what makes it a reasonable thing to hand them.
+    # These caps are dropped anyway; nothing AIOS runs needs them.
+    cap_drop:
+      - SYS_ADMIN
+      - NET_ADMIN
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8787/health"]
+      interval: 30s
+      timeout: 5s
+      start_period: 180s
+      retries: 5
+    stop_grace_period: 30s
+
+volumes:
+  aios-state:

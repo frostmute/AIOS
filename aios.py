@@ -1593,6 +1593,8 @@ def cmd_update(args):
         mount_openui(cfg)
     if cfg_get(cfg, "skills.mount", True):
         mount_aios_skills(cfg)
+        mount_agent_modes(cfg)  # caveman + ponytail — same set setup mounts
+        mount_ruflo(cfg)
     # Restart any services that are currently running so the new code takes effect.
     specs = service_specs(cfg)
     running = [s for s in specs if (read_pid(s) and pid_alive(read_pid(s)["pid"]))]
