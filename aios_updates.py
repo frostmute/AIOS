@@ -52,6 +52,7 @@ SOURCES = {
     "fabric":     {"repo": "danielmiessler/fabric",     "dir": "fabric-main",          "tier": "content"},
     "caveman":    {"repo": "JuliusBrussee/caveman",     "dir": "caveman-main",         "tier": "content"},
     "ponytail":   {"repo": "DietrichGebert/ponytail",   "dir": "ponytail-main",        "tier": "content"},
+    "ruflo":      {"repo": "ruvnet/ruflo",              "dir": "ruflo-main",           "tier": "content"},
 }
 
 # What each project is used for — given to the agent so its risk call is grounded
@@ -66,6 +67,8 @@ INTEGRATION_NOTES = {
     "fabric": "AIOS reads data/patterns/*/system.md only (255 prompt files). No code from it executes.",
     "caveman": "AIOS reads skills/caveman/SKILL.md as a system-prompt overlay and mounts its skills.",
     "ponytail": "AIOS reads skills/ponytail/SKILL.md as a system-prompt overlay and mounts its skills.",
+    "ruflo": ("AIOS mounts its SKILL.md and lists plugins/*/skills. The runtime comes from "
+              "npm (`npx ruflo@latest`), so upstream code changes here are docs/skills only."),
 }
 
 

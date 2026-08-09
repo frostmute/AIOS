@@ -34,6 +34,7 @@ import aios_brain as brain    # noqa: E402  durable state: memory, tasks, flows,
 import aios_sec as sec        # noqa: E402  the gate in front of full-control mode
 import aios_tools as tools    # noqa: E402  shell + channel/skill catalogs
 import aios_updates as updates  # noqa: E402  agent-supervised dependency updates
+import aios_web as web          # noqa: E402  YouTube / Reddit / HN / page readers
 
 PORT = int(os.environ.get("AIOS_HUB_PORT", "8787"))
 ROOT = Path(os.environ.get("AIOS_ROOT", Path(__file__).resolve().parent))
@@ -463,6 +464,15 @@ def brain_system_prompt(message: str) -> str:
             "Ops: set (vars/css/scale/density) · nav (hidden/order) · panel (add/del/clear, "
             "slot top|chat|sidebar, self-contained HTML styled with var(--accent) etc.) · "
             "reset (what: all|vars|css|panels|nav). Full reference: the `dashboard-designer` skill.")
+        sysp += (
+            "\n\nREADING THE WEB: you can read YouTube videos (full transcripts), Reddit "
+            "threads, Hacker News and any web page through the hub — use these instead of "
+            "writing your own scraper, and never claim you cannot open a link:\n"
+            f"  RUN: curl -s -X POST http://127.0.0.1:{PORT}/api/web -H 'Content-Type: application/json' "
+            "-d '{\"op\":\"youtube\",\"url\":\"<link>\"}'\n"
+            "ops: youtube (transcript_timestamped + title/channel/chapters) · reddit (post+comments, "
+            "r/sub, or a search phrase) · hn · search · fetch (any URL -> readable text). "
+            "Add \"|python -c ...\" or pipe through jq to trim big payloads before reading them.")
     sysp += active_recall(message)      # Active Memory: relevant context, every turn
     sysp += modes_prompt_suffix()       # caveman / ponytail overlays when toggled on
     return sysp
@@ -1478,6 +1488,26 @@ class Handler(BaseHTTPRequestHandler):
                              f"**{st[hit]['level']}** — {meta['blurb']}. `/{hit} off` to stop.")
                 self._send(200, {"target": target, "reply": reply, "ran": []})
                 return
+            # Inline web reads: /yt <url> · /reddit <target> · /web <url>
+            wm = re.match(r"^/(yt|youtube|reddit|web|hn)\s+(.+)$", message.strip(), re.I)
+            if wm:
+                kind, arg = wm.group(1).lower(), wm.group(2).strip()
+                fn = {"yt": web.youtube, "youtube": web.youtube, "reddit": web.reddit,
+                      "hn": web.hackernews}.get(kind, web.fetch)
+                r = fn(arg)
+                if not r.get("ok"):
+                    md = f"⚠️ {r.get('error', 'failed')}"
+                elif kind in ("yt", "youtube"):
+                    md = (f"### {r['title']}\n**{r['channel']}** · {r['duration']} · "
+                          f"{r['views']:,} views\n\n" +
+                          (f"**Transcript** ({r.get('words', 0)} words"
+                           f"{', auto-generated' if r.get('transcript_auto') else ''}):\n\n"
+                           f"{r.get('transcript_timestamped', '')[:6000]}"
+                           if r.get("transcript") else f"_{r.get('note', 'No transcript.')}_"))
+                else:
+                    md = "```json\n" + json.dumps(r, indent=1)[:6000] + "\n```"
+                self._send(200, {"target": "web", "reply": md, "ran": []})
+                return
             # Inline fabric: /p <pattern> <text>  or  /pattern <name> <text>
             if cmd.startswith(("/p ", "/pattern ")):
                 rest = message.split(None, 1)[1] if len(message.split()) > 1 else ""
@@ -1596,6 +1626,30 @@ class Handler(BaseHTTPRequestHandler):
             st = set_mode(payload.get("mode", ""), payload.get("enabled", False),
                           payload.get("level", "full"))
             self._send(200, {"state": st})
+        elif self.path == "/api/web":
+            # Real reads of YouTube / Reddit / HN / any page. One op per source so
+            # an agent never has to hand-roll scraping.
+            op = (payload.get("op") or "fetch").lower()
+            q = payload.get("url") or payload.get("query") or payload.get("target") or ""
+            try:
+                if op in ("youtube", "yt"):
+                    r = web.youtube(q, want_transcript=payload.get("transcript", True),
+                                    lang=payload.get("lang", "en"))
+                elif op == "reddit":
+                    r = web.reddit(q, limit=int(payload.get("limit", 60)),
+                                   sort=payload.get("sort", "top"))
+                elif op in ("hn", "hackernews"):
+                    r = web.hackernews(q, story_id=payload.get("story_id", ""),
+                                       limit=int(payload.get("limit", 20)))
+                elif op == "search":
+                    r = web.search(q, limit=int(payload.get("limit", 10)))
+                else:
+                    r = web.fetch(q, max_chars=int(payload.get("max_chars", 20000)))
+            except Exception as e:
+                r = {"ok": False, "error": f"{op} failed: {e}"}
+            brain.audit(payload.get("by", "agent"), "web." + op,
+                        f"{q[:120]} -> ok={r.get('ok')}")
+            self._send(200, r)
         elif self.path == "/api/dashboard":
             self._send(200, dashboard_update(payload))
         elif self.path == "/api/updates":

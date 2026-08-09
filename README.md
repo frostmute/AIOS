@@ -2,7 +2,7 @@
 
 # 🧠 The AI OS
 
-### Eight open-source AI projects. One operating system. One Control Room.
+### Nine open-source AI projects. One operating system. One Control Room.
 
 <p align="center">
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-8B5CF6?style=for-the-badge" alt="MIT License"></a>
@@ -23,6 +23,7 @@
   <img src="https://img.shields.io/badge/+_Fabric-255_patterns-0EA5E9?style=flat-square" alt="Fabric">
   <img src="https://img.shields.io/badge/+_Caveman-say_less-A16207?style=flat-square" alt="Caveman">
   <img src="https://img.shields.io/badge/+_Ponytail-build_less-DB2777?style=flat-square" alt="Ponytail">
+  <img src="https://img.shields.io/badge/+_Ruflo-314_MCP_tools-7C3AED?style=flat-square" alt="Ruflo">
 </p>
 
 **[Install](#-install-one-line)** · **[Control Room](#-the-control-room)** · **[Architecture](#️-architecture)** · **[Commands](#️-command-reference)** · **[Full docs](README.aios.md)** · **[Website](https://zdstudios.github.io/AIOS/)**
@@ -31,7 +32,7 @@
 
 ---
 
-**The AI OS** takes eight independent open-source AI projects and makes them work as **one auto-configured
+**The AI OS** takes nine independent open-source AI projects and makes them work as **one auto-configured
 system** you drive from a single command — **`aios`** — and a single web **Control Room** where you can
 **talk to everything and have the agents talk to each other**.
 
@@ -41,7 +42,7 @@ together, mounts your shared skills, and adds **OpenUI** generative-UI context t
 
 > You can't fuse three runtimes and multiple package managers into a single file — that would just break
 > everything. So "one file" here means **one control surface** (`aios`) + **one dashboard** (the Hub) over
-> eight real, unmodified projects. It installs, configures, wires, runs, tests, and debugs all of them.
+> nine real, unmodified projects. It installs, configures, wires, runs, tests, and debugs all of them.
 
 <div align="center">
 
@@ -239,6 +240,54 @@ That is deliberately the "ambient authority" posture that made **OpenClaw's CVE-
 - **Everything is audited.** Every command any agent runs is written to `.aios/aios.db` and shown in **Control & Audit**.
 
 **Active Memory:** a memory sub-agent runs on **every** turn — recall is a free FTS5 query, fact-extraction is one small async call — so the agents actually learn your workflow over time instead of only reading memory at session start (`memory.active`).
+
+## 🌐 It can actually read the web
+
+Paste a link and the agents read it — no API keys, no "I can't open URLs".
+
+| Source | What you get |
+|---|---|
+| **YouTube** | Full **transcript** (flat, timestamped, or segment objects), title, channel, duration, views, description, **chapters**, available languages |
+| **Reddit** | A thread with its **comment tree**, a subreddit listing, or a search |
+| **Hacker News** | Story search, or a story with its full comment thread |
+| **Any page** | Reduced to clean readable text |
+| **Search** | DuckDuckGo, no key |
+
+```bash
+aios web youtube "https://youtu.be/VIDEO_ID"      # transcript in your terminal
+aios web reddit  "r/LocalLLaMA"                   # or a thread URL, or a search
+aios web fetch   "https://example.com/article"
+```
+
+In chat: `/yt <url>`, `/reddit <target>`, `/hn <query>`, `/web <url>` — or just paste a
+link and ask; the Brain calls `POST /api/web` itself. The bundled **`web-research`**
+skill teaches every agent the same API.
+
+Two honest caveats, both surfaced in the response rather than hidden:
+- **YouTube transcripts need `yt-dlp`** (`aios setup` installs it). YouTube now serves
+  its caption endpoint an empty body unless the request carries a proof-of-origin
+  token, so scraping it directly no longer works — yt-dlp is what keeps up with that.
+  Without it you still get metadata, and the `note` tells you what to install.
+- **Reddit blocks its JSON API from many networks**, so AIOS falls back to RSS
+  automatically. When that happens the response says `"source":"rss"` and **scores are
+  `null`** — the agents are told not to report vote counts they didn't actually get.
+  Reddit also rate-limits hard, so calls are throttled and retried.
+
+## 🤖 Ruflo — heavyweight orchestration on demand
+
+[ruvnet/ruflo](https://github.com/ruvnet/ruflo) is an agent meta-harness: multi-agent
+**swarms**, **314+ MCP tools**, vector memory, federation, and 30+ plugins. AIOS ships
+its skills and plugin catalogue and drives the runtime from npm, so it's always current.
+
+```bash
+aios ruflo plugins         # the 30+ plugins and their skill counts
+aios ruflo init wizard     # set it up inside a project
+aios ruflo mcp-register    # register its MCP server with Claude Code
+aios ruflo <anything>      # passed through to `npx ruflo@latest`
+```
+
+AIOS is the always-on system (services, channels, dashboard, Task Brain); ruflo is a
+per-project harness you invoke for a heavy job. They compose.
 
 ## 🎨 Agents can redesign the dashboard (safely)
 

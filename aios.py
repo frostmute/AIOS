@@ -269,6 +269,7 @@ PROJECTS = {
     "fabric": resolve_root("fabric-main/fabric-main", "fabric-main", "fabric"),
     "caveman": resolve_root("caveman-main/caveman-main", "caveman-main", "caveman"),
     "ponytail": resolve_root("ponytail-main/ponytail-main", "ponytail-main", "ponytail"),
+    "ruflo": resolve_root("ruflo-main/ruflo-main", "ruflo-main", "ruflo"),
 }
 
 
@@ -810,6 +811,7 @@ def cmd_setup(args):
     if cfg_get(cfg, "skills.mount", True):
         mount_aios_skills(cfg)
         mount_agent_modes(cfg)  # caveman + ponytail skills → every agent
+        mount_ruflo(cfg)        # ruflo orchestration skill → every agent
 
     # 7) wire openclaw-os plugin (best-effort; needs openclaw runnable)
     if cfg_get(cfg, "services.openclaw_os.enabled", True) and not args.skip_wire:
@@ -955,8 +957,31 @@ def _ensure_tools(args):
                 err(f"{t} still not found — open a new shell or install manually: {cmdline}")
 
 
+def install_web_deps():
+    """yt-dlp powers YouTube transcripts. YouTube now serves its caption endpoint an
+    empty body without a proof-of-origin token, and yt-dlp is what keeps up with
+    that — without it AIOS can read video metadata but not what was said."""
+    try:
+        import yt_dlp  # noqa: F401,PLC0415
+        ok("yt-dlp present (YouTube transcripts enabled)")
+        return True
+    except Exception:
+        pass
+    print(f"{C.GRY}$ {sys.executable} -m pip install yt-dlp{C.R}")
+    r = subprocess.run([sys.executable, "-m", "pip", "install", "--quiet",
+                        "--disable-pip-version-check", "yt-dlp"],
+                       capture_output=True, text=True)
+    if r.returncode == 0:
+        ok("installed yt-dlp (YouTube transcripts enabled)")
+        return True
+    warn("could not install yt-dlp — YouTube metadata will work, transcripts won't. "
+         "Install it manually: pip install yt-dlp")
+    return False
+
+
 def _install_all(cfg):
     head("Installing dependencies")
+    install_web_deps()
     # opencode: --ignore-scripts skips native postinstalls (tree-sitter-powershell,
     # node-pty) that need VS Build Tools on Windows and are unused by `serve`.
     jobs = [
@@ -1822,6 +1847,108 @@ def cmd_wire(args):
     wire_full_control(load_config())
 
 
+def mount_ruflo(cfg: dict):
+    """Mount ruflo's entry-point skill so agents know the `npx ruflo` surface and its
+    ~314 MCP tools. Its 136 plugin skills stay on disk and are listed by
+    `aios ruflo plugins` — copying them all into every agent would drown context."""
+    src = PROJECTS.get("ruflo") or (ROOT / "ruflo-main")
+    sk = src / "SKILL.md"
+    if not sk.exists():
+        return
+    head("Mounting ruflo skill")
+    for t in (Path.home() / ".openclaw" / "skills" / "ruflo",
+              Path.home() / ".hermes" / "skills" / "ruflo",
+              STATE / "skills" / "ruflo"):
+        try:
+            t.mkdir(parents=True, exist_ok=True)
+            shutil.copy(sk, t / "SKILL.md")
+        except Exception as e:
+            warn(f"could not mount ruflo → {t}: {e}")
+    n = len(list((src / "plugins").glob("*/skills/*/SKILL.md"))) if (src / "plugins").exists() else 0
+    ok(f"ruflo skill mounted ({n} plugin skills available via `aios ruflo plugins`)")
+
+
+def cmd_ruflo(args):
+    """Run ruflo (agent meta-harness). Delegates to the npm package, which is the
+    supported delivery channel — the vendored copy here is only skills + docs."""
+    src = PROJECTS.get("ruflo") or (ROOT / "ruflo-main")
+    sub = list(getattr(args, "args", []) or [])
+
+    if sub and sub[0] == "plugins":
+        pdir = src / "plugins"
+        if not pdir.exists():
+            die("ruflo plugins not found — re-run `aios setup`")
+        head("Ruflo plugins")
+        for d in sorted(p for p in pdir.iterdir() if p.is_dir()):
+            skills = list(d.glob("skills/*/SKILL.md"))
+            say(f"  {C.CYN}{d.name:<26}{C.R}{C.GRY}{len(skills)} skill(s){C.R}")
+        say(f"\n{C.GRY}Enable one inside a project:{C.R} npx ruflo@latest plugin add <name>")
+        return
+
+    if sub and sub[0] == "mcp-register":
+        claude = find_tool("claude")
+        if not claude:
+            die("the `claude` CLI is not installed — see `aios claude-login`")
+        cmd = [claude, "mcp", "add", "ruflo", "--", "npx", "ruflo@latest", "mcp", "start"]
+        say(f"{C.GRY}$ {' '.join(cmd)}{C.R}")
+        rc = subprocess.run(cmd, cwd=str(ROOT)).returncode
+        (ok if rc == 0 else warn)("ruflo MCP registered with Claude Code" if rc == 0
+                                  else f"registration exited {rc}")
+        return
+
+    npx = find_tool("npx")
+    if not npx:
+        die("npx not found — install Node >= 20 (see `aios doctor`)")
+    cmd = [npx, "ruflo@latest"] + (sub or ["--help"])
+    say(f"{C.GRY}$ {' '.join(cmd)}{C.R}")
+    try:
+        sys.exit(subprocess.run(cmd, cwd=str(ROOT), env=child_env({})).returncode)
+    except KeyboardInterrupt:
+        pass
+
+
+def cmd_web(args):
+    """Read YouTube / Reddit / Hacker News / any page from the terminal."""
+    sys.path.insert(0, str(ROOT))
+    import aios_web as W
+    op, arg = args.op, " ".join(args.arg or [])
+    if not arg:
+        die(f"usage: aios web {op} <url-or-query>")
+    fn = {"youtube": W.youtube, "yt": W.youtube, "reddit": W.reddit,
+          "hn": W.hackernews, "search": W.search, "fetch": W.fetch}[op]
+    r = fn(arg)
+    if not r.get("ok"):
+        warn(r.get("error", "failed"))
+        sys.exit(1)
+    if op in ("youtube", "yt"):
+        head(r["title"])
+        say(f"  {C.GRY}{r['channel']} · {r['duration']} · {r['views']:,} views{C.R}")
+        if r.get("chapters"):
+            say(f"\n{C.B}Chapters{C.R}")
+            for c in r["chapters"][:12]:
+                say(f"  {C.GRY}{c['ts']:>7}{C.R}  {c['title']}")
+        if r.get("transcript"):
+            auto = " (auto-generated)" if r.get("transcript_auto") else ""
+            say(f"\n{C.B}Transcript{C.R} {C.GRY}{r['words']} words{auto}{C.R}\n")
+            say(r["transcript_timestamped"] if getattr(args, "timestamps", False)
+                else r["transcript_text"])
+        else:
+            warn(r.get("note", "no transcript"))
+    elif op == "reddit" and r.get("kind") == "post":
+        head(r["title"])
+        if r.get("selftext"):
+            say(r["selftext"][:2000])
+        say(f"\n{C.B}{r.get('comments_returned', 0)} comments{C.R}")
+        for c in r.get("comments", [])[:25]:
+            sc = f"[{c['score']}] " if c.get("score") is not None else ""
+            body = c["body"][:600].replace("\n", "\n  ")
+            say(f"\n  {C.CYN}{c['author']}{C.R} {C.GRY}{sc}{C.R}\n  {body}")
+        if r.get("note"):
+            say(f"\n{C.GRY}{r['note']}{C.R}")
+    else:
+        print(json.dumps(r, indent=2)[:12000])
+
+
 def cmd_updates(args):
     """Supervised updates: what moved upstream, what the agents think, apply/rollback."""
     sys.path.insert(0, str(ROOT))
@@ -2056,11 +2183,11 @@ def _print_urls(cfg):
 # unreadable once you have 25 subcommands.
 HELP_GROUPS = [
     ("Get started", ["setup", "start", "stop", "restart", "status", "url"]),
-    ("Everyday", ["logs", "doctor", "exec", "channels", "profile", "token"]),
-    ("Agents & updates", ["updates", "update", "claude-login", "attach", "migrate", "wire"]),
+    ("Everyday", ["logs", "doctor", "exec", "web", "channels", "profile", "token"]),
+    ("Agents & updates", ["updates", "update", "claude-login", "ruflo", "attach", "migrate", "wire"]),
     ("Advanced", ["test", "debug", "autostart", "install-cli", "bootstrap"]),
 ]
-TAGLINE = "Eight open-source AI projects. One operating system."
+TAGLINE = "Nine open-source AI projects. One operating system."
 
 
 class AiosParser(argparse.ArgumentParser):
@@ -2194,6 +2321,17 @@ def build_parser():
     s.add_argument("--apply", metavar="PROJECT", help="apply one project's update (verify + auto-rollback)")
     s.add_argument("--rollback", metavar="PROJECT", help="restore a project's previous version")
     s.set_defaults(func=cmd_updates)
+
+    s = sub.add_parser("web", help="read a YouTube video, Reddit thread, HN or any page")
+    s.add_argument("op", choices=["youtube", "yt", "reddit", "hn", "search", "fetch"])
+    s.add_argument("arg", nargs=argparse.REMAINDER)
+    s.add_argument("--timestamps", action="store_true", help="keep [mm:ss] on transcripts")
+    s.set_defaults(func=cmd_web)
+
+    s = sub.add_parser("ruflo", help="ruflo meta-harness: 314+ MCP tools, swarms, plugins")
+    s.add_argument("args", nargs=argparse.REMAINDER,
+                   help="passed to `npx ruflo` — or: plugins | mcp-register")
+    s.set_defaults(func=cmd_ruflo)
 
     s = sub.add_parser("token", help="print the hub token (needed for non-loopback access)")
     s.add_argument("--rotate", action="store_true", help="generate a fresh token")
