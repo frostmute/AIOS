@@ -29,6 +29,11 @@ services:
   claudecode:              # claude-code-api — Claude Code as an OpenAI-compatible API (6th agent)
     enabled: true
     port: 8000
+  codex:                   # ChatGPT/Codex via the local `codex` CLI (no API key)
+    enabled: true
+    port: 8010
+    model: ""              # blank = whatever codex itself is configured to use
+    sandbox: read-only     # read-only | workspace-write | danger-full-access
   openclaw_proxy:          # frame-stripping proxy so openclaw's control-UI embeds in the hub
     enabled: true
     port: 8791
@@ -100,6 +105,7 @@ health:
   openclaw: http://127.0.0.1:18789/
   crewai: http://127.0.0.1:4788/health
   claudecode: http://127.0.0.1:8000/health
+  codex: http://127.0.0.1:8010/health
   openclaw_proxy: http://127.0.0.1:8791/
   hermes_proxy: http://127.0.0.1:8792/
   hub: http://127.0.0.1:8787/health

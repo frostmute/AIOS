@@ -236,6 +236,7 @@
     <button class="nav" data-v="openclaw" data-svc="openclaw" onclick="nav('openclaw')"><span class="ic">🦞</span> openclaw <span class="dot"></span></button>
     <button class="nav" data-v="crewai" data-svc="crewai" onclick="nav('crewai')"><span class="ic">👥</span> CrewAI <span class="dot"></span></button>
     <button class="nav" data-v="claudecode" data-svc="claudecode" onclick="nav('claudecode')"><span class="ic">◈</span> claude-code <span class="dot"></span></button>
+    <button class="nav" data-v="codex" data-svc="codex" onclick="nav('codex')"><span class="ic">⌁</span> Codex <span class="dot"></span></button>
 
     <div class="sec">Dashboards</div>
     <button class="nav" data-v="openclawos" data-svc="openclaw-os" onclick="nav('openclawos')"><span class="ic">🪟</span> openclaw-os <span class="dot"></span></button>
@@ -280,6 +281,7 @@
             <button class="chip" data-t="crewai">👥 CrewAI</button>
             <button class="chip" data-t="opencode">⌨️ opencode</button>
             <button class="chip" data-t="claudecode">◈ claude-code</button>
+            <button class="chip" data-t="codex" title="OpenAI Codex via your ChatGPT subscription">⌁ Codex</button>
             <button class="chip" data-t="swarm" title="Big task: decompose across specialist agents running in parallel">🐝 Swarm</button>
             <button class="chip" data-t="fabric" title="Run a Fabric pattern (type: pattern: your text)">🧵 Fabric</button>
             <button class="chip" data-t="all">🌐 All</button>
@@ -313,6 +315,8 @@
     <!-- INFO AGENTS (opencode / crewai / claude-code) -->
     <div id="opencode" class="view"><div class="vhead"><h2>⌨️ opencode</h2><span class="sub">coding-agent engine</span></div><div class="vbody pad" id="opencodeBody"></div></div>
     <div id="crewai" class="view"><div class="vhead"><h2>👥 CrewAI</h2><span class="sub">multi-agent crews</span></div><div class="vbody pad" id="crewaiBody"></div></div>
+    <div id="codex" class="view"><div class="vhead"><h2>⌁ Codex</h2><span class="sub">OpenAI Codex via your ChatGPT subscription</span></div><div class="vbody pad" id="codexBody"></div></div>
+
     <div id="claudecode" class="view"><div class="vhead"><h2>◈ claude-code</h2><span class="sub">Claude Code as an OpenAI-compatible API</span></div><div class="vbody pad" id="claudecodeBody"></div></div>
 
     <!-- CANVAS (generative UI any agent can edit) -->
@@ -669,8 +673,8 @@
     const same=(typeof u==='string')&&(u.startsWith('/')||u.startsWith(location.origin));
     if(AIOS_TOKEN&&same){o.headers=Object.assign({'Authorization':'Bearer '+AIOS_TOKEN},o.headers||{});}
     return _f(u,o);};})();
-  const ROLES={opencode:"coding engine",hermes:"autonomous agent",openclaw:"channel gateway",crewai:"multi-agent crews",claudecode:"Claude Code API","openclaw-os":"dashboard",hub:"brain + interconnect"};
-  const ICON={opencode:"⌨️",hermes:"☤",openclaw:"🦞",crewai:"👥",claudecode:"◈","openclaw-os":"🪟",hub:"◆",brain:"◆",team:"✦",all:"🌐"};
+  const ROLES={opencode:"coding engine",hermes:"autonomous agent",openclaw:"channel gateway",crewai:"multi-agent crews",claudecode:"Claude Code API",codex:"Codex (ChatGPT sub)","openclaw-os":"dashboard",hub:"brain + interconnect"};
+  const ICON={opencode:"⌨️",hermes:"☤",openclaw:"🦞",crewai:"👥",claudecode:"◈",codex:"⌁","openclaw-os":"🪟",hub:"◆",brain:"◆",team:"✦",all:"🌐"};
   let target="brain", peers={}, svc={}, history=[];
 
   // ── themes (applied as CSS vars from JS → enables the theme store) ──
@@ -750,6 +754,7 @@
     if(v==='openclaw')frame('clawFrame','clawNew',peers['openclaw-embed']||peers.openclaw);
     if(v==='opencode')agentPanel('opencode','opencodeBody','The headless coding-agent engine. Chat with it from the Chat tab (target “opencode”) or call its HTTP API/SDK.',peers.opencode);
     if(v==='crewai')agentPanel('crewai','crewaiBody','Role-based multi-agent crews. Chat with it from the Chat tab (target “CrewAI”). It can call the other agents via the hub.',peers.crewai);
+    if(v==='codex')agentPanel('codex','codexBody','OpenAI Codex, wrapped as an OpenAI-compatible API by <span class="mono">services/codex_api.py</span>. Auth is your <span class="mono">codex login</span> — no API key. Chat with it here (target <b>Codex</b>) or POST to <span class="mono">'+(peers.codex||'http://127.0.0.1:8010')+'/v1</span>.',peers.codex);
     if(v==='claudecode')agentPanel('claudecode','claudecodeBody','Claude Code exposed as an OpenAI-compatible API. Chat with it (target “claude-code”), or point any tool at <span class="mono">'+(peers.claudecode||'http://127.0.0.1:8000')+'/v1</span>. Needs the <span class="mono">claude</span> CLI installed + authenticated.',peers.claudecode);
     if(v==='automations')loadSchedules();
     if(v==='canvas')loadCanvas();

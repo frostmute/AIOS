@@ -101,6 +101,7 @@ PEERS = {
     "openclaw": os.environ.get("AIOS_OPENCLAW_URL", "http://127.0.0.1:18789"),
     "crewai": os.environ.get("AIOS_CREWAI_URL", "http://127.0.0.1:4788"),
     "claudecode": os.environ.get("AIOS_CLAUDECODE_URL", "http://127.0.0.1:8000"),
+    "codex": os.environ.get("AIOS_CODEX_URL", "http://127.0.0.1:8010"),
     "openclaw-os": os.environ.get("AIOS_OPENCLAWOS_URL", "http://127.0.0.1:18789/plugins/openclawos/"),
 }
 CLAUDECODE = os.environ.get("AIOS_CLAUDECODE_URL", "http://127.0.0.1:8000").rstrip("/")
@@ -118,7 +119,7 @@ def read_system_prompt() -> str:
 
 
 # Chat "targets" the AIOS API exposes as OpenAI-style models.
-TARGETS = ["brain", "team", "swarm", "opencode", "crewai", "claudecode", "fabric", "all"]
+TARGETS = ["brain", "team", "swarm", "opencode", "crewai", "claudecode", "codex", "fabric", "all"]
 
 MEMORY_FILE = ROOT / ".aios" / "memory.json"
 USAGE_FILE = ROOT / ".aios" / "usage.json"
@@ -369,6 +370,24 @@ def ask_opencode(message: str) -> str:
         return "⚠️ opencode timed out (240s)."
     except Exception as e:
         return f"⚠️ opencode error: {e}"
+
+
+def ask_codex(message: str, history: list | None = None) -> str:
+    """Codex CLI through its OpenAI-compatible bridge (services/codex_api.py)."""
+    base = os.environ.get("AIOS_CODEX_URL", "http://127.0.0.1:8010").rstrip("/")
+    msgs = (history or []) + [{"role": "user", "content": message}]
+    try:
+        d = post_json(base + "/v1/chat/completions",
+                      {"model": "codex", "messages": msgs}, timeout=620)
+        return (d.get("choices") or [{}])[0].get("message", {}).get("content", "") or             "(codex returned nothing)"
+    except urllib.error.HTTPError as e:
+        try:
+            return "⚠️ " + json.loads(e.read()).get("error", {}).get("message", str(e))
+        except Exception:
+            return f"⚠️ codex error: {e}"
+    except Exception as e:
+        return (f"⚠️ codex-api not reachable ({e}). Start it with `aios start codex`, "
+                f"and make sure the `codex` CLI is installed and logged in.")
 
 
 def ask_claudecode(message: str, history: list | None = None) -> str:
@@ -682,6 +701,9 @@ def route(target: str, message: str, history: list | None = None) -> str:
         return ask_opencode(message)
     if target in ("claudecode", "claude-code"):
         return ask_claudecode(message, history)
+    if target == "codex":
+        act("agent", "Handing off to Codex…")
+        return ask_codex(message, history)
     if target == "fabric":
         # "pattern: text"  →  run that fabric pattern; else summarize by default.
         pat, _, txt = message.partition(":")
@@ -1184,6 +1206,7 @@ AGENT_TOOLS = {
     "opencode": "writing/editing/running code, repos, technical build tasks",
     "crewai": "multi-step research or workflows that benefit from a crew of roles",
     "claudecode": "Claude Code — coding with the Claude Code CLI",
+    "codex": "OpenAI Codex — coding via your ChatGPT/Codex subscription",
 }
 
 

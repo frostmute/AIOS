@@ -2,7 +2,7 @@
 
 # 🧠 The AI OS
 
-### Nine open-source AI projects. One operating system. One Control Room.
+### Ten open-source AI projects. One operating system. One Control Room.
 
 <p align="center">
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-8B5CF6?style=for-the-badge" alt="MIT License"></a>
@@ -24,6 +24,7 @@
   <img src="https://img.shields.io/badge/+_Caveman-say_less-A16207?style=flat-square" alt="Caveman">
   <img src="https://img.shields.io/badge/+_Ponytail-build_less-DB2777?style=flat-square" alt="Ponytail">
   <img src="https://img.shields.io/badge/+_Ruflo-314_MCP_tools-7C3AED?style=flat-square" alt="Ruflo">
+  <img src="https://img.shields.io/badge/+_Codex-ChatGPT_sub-10A37F?style=flat-square" alt="Codex">
 </p>
 
 **[Install](#-install-one-line)** · **[Control Room](#-the-control-room)** · **[Architecture](#️-architecture)** · **[Commands](#️-command-reference)** · **[Full docs](README.aios.md)** · **[Website](https://zdstudios.github.io/AIOS/)**
@@ -32,7 +33,7 @@
 
 ---
 
-**The AI OS** takes nine independent open-source AI projects and makes them work as **one auto-configured
+**The AI OS** takes ten independent open-source AI projects and makes them work as **one auto-configured
 system** you drive from a single command — **`aios`** — and a single web **Control Room** where you can
 **talk to everything and have the agents talk to each other**.
 
@@ -42,7 +43,7 @@ together, mounts your shared skills, and adds **OpenUI** generative-UI context t
 
 > You can't fuse three runtimes and multiple package managers into a single file — that would just break
 > everything. So "one file" here means **one control surface** (`aios`) + **one dashboard** (the Hub) over
-> nine real, unmodified projects. It installs, configures, wires, runs, tests, and debugs all of them.
+> ten real, unmodified projects. It installs, configures, wires, runs, tests, and debugs all of them.
 
 <div align="center">
 
@@ -115,6 +116,7 @@ aios url                 # open the Control Room
 | **openclaw** | Multi-channel messaging gateway + plugin host | `18789` | [openclaw.ai](https://github.com/openclaw/openclaw) |
 | **CrewAI** | Multi-agent orchestration — role-based crews | `4788` | [crewaiinc/crewai](https://github.com/crewaiinc/crewai) |
 | **claude-code** | Claude Code as an OpenAI-compatible API | `8000` | [codingworkflow/claude-code-api](https://github.com/codingworkflow/claude-code-api) |
+| **Codex** | OpenAI Codex CLI as an OpenAI-compatible API — your ChatGPT sub, no API key | `8010` | [openai/codex](https://github.com/openai/codex) |
 | **LifeOS** | Shared identity + skills mounted into the agents | — | [danielmiessler/LifeOS](https://github.com/danielmiessler/LifeOS) |
 
 Plus the integrations that glue it together — these aren't services, they're mounted into every agent:

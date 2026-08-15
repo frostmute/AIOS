@@ -340,6 +340,8 @@ PROVIDER_VAR = {
     "gemini": "GEMINI_API_KEY",
     # Claude Pro/Max via claude-code-api (OpenAI-compatible; auth is the Claude CLI login).
     "claudecode": "OPENAI_API_KEY",
+    # ChatGPT/Codex via the local codex CLI (auth is `codex login`, no API key).
+    "codex": "OPENAI_API_KEY",
 }
 PASSTHROUGH_KEYS = [
     "OPENROUTER_API_KEY", "ANTHROPIC_API_KEY", "OPENAI_API_KEY",
@@ -436,6 +438,22 @@ def service_specs(cfg: dict) -> dict:
             "health": cfg_get(cfg, "health.claudecode", f"http://127.0.0.1:{port}/health"),
             "tool": "uv",
         }
+    # Codex CLI as an OpenAI-compatible API (mirror of claude-code-api). Pure
+    # stdlib, so it runs on the same interpreter as aios itself.
+    if cfg_get(cfg, "services.codex.enabled", True):
+        cxp = int(cfg_get(cfg, "services.codex.port", 8010))
+        specs["codex"] = {
+            "enabled": True,
+            "cwd": ROOT,
+            "cmd": [sys.executable, str(ROOT / "services" / "codex_api.py")],
+            "port": cxp,
+            "health": cfg_get(cfg, "health.codex", f"http://127.0.0.1:{cxp}/health"),
+            "tool": "python",
+            "env": {"AIOS_CODEX_PORT": str(cxp),
+                    "AIOS_CODEX_MODEL": str(cfg_get(cfg, "services.codex.model", "")),
+                    "AIOS_CODEX_SANDBOX": str(cfg_get(cfg, "services.codex.sandbox", "read-only"))},
+        }
+
     # Frame-stripping reverse proxies so openclaw + hermes control-UIs embed in the hub.
     if cl and cfg_get(cfg, "services.openclaw_proxy.enabled", True):
         pport = int(cfg_get(cfg, "services.openclaw_proxy.port", 8791))
@@ -488,7 +506,7 @@ def service_specs(cfg: dict) -> dict:
 
 
 START_ORDER = ["opencode", "hermes", "hermes-gateway", "hermes-proxy", "openclaw",
-               "openclaw-proxy", "crewai", "claudecode", "hub"]
+               "openclaw-proxy", "crewai", "claudecode", "codex", "hub"]
 
 
 def openclaw_env() -> dict:
@@ -519,6 +537,7 @@ def interconnect_env(cfg: dict) -> dict:
         "AIOS_CREWAI_URL": f"http://127.0.0.1:{crp}",
         "AIOS_CREWAI_PORT": str(crp),
         "AIOS_CLAUDECODE_URL": f"http://127.0.0.1:{ccp}",
+        "AIOS_CODEX_URL": f"http://127.0.0.1:{cfg_get(cfg, 'services.codex.port', 8010)}",
         "AIOS_OPENCLAWPROXY_URL": f"http://127.0.0.1:{pxp}/",
         "AIOS_HERMESPROXY_URL": f"http://127.0.0.1:{hxp}/",
         "AIOS_OPENCLAWOS_URL": f"http://127.0.0.1:{clp}/plugins/openclawos/",
@@ -897,15 +916,16 @@ def _wizard_env(args):
     elif interactive:
         say(f"\n  {C.B}How should the agents talk to a model?{C.R}")
         say(f"    {C.CYN}1{C.R}  Claude Pro/Max subscription  {C.GRY}— no API key, no per-token cost{C.R}")
-        say(f"    {C.CYN}2{C.R}  OpenRouter                   {C.GRY}— one key, most models{C.R}")
-        say(f"    {C.CYN}3{C.R}  Anthropic API key")
-        say(f"    {C.CYN}4{C.R}  OpenAI API key")
-        say(f"    {C.CYN}5{C.R}  Google Gemini API key")
+        say(f"    {C.CYN}2{C.R}  ChatGPT / Codex subscription {C.GRY}— via the local codex CLI{C.R}")
+        say(f"    {C.CYN}3{C.R}  OpenRouter                   {C.GRY}— one key, most models{C.R}")
+        say(f"    {C.CYN}4{C.R}  Anthropic API key")
+        say(f"    {C.CYN}5{C.R}  OpenAI API key")
+        say(f"    {C.CYN}6{C.R}  Google Gemini API key")
         say(f"    {C.GRY}s{C.R}  skip for now")
-        choice = input(f"  Choice [1-5/s] ({data['AIOS_LLM_PROVIDER']}): ").strip().lower()
+        choice = input(f"  Choice [1-6/s] ({data['AIOS_LLM_PROVIDER']}): ").strip().lower()
 
-        by_num = {"1": "claude", "2": "openrouter", "3": "anthropic",
-                  "4": "openai", "5": "gemini", "s": "skip"}
+        by_num = {"1": "claude", "2": "codex", "3": "openrouter", "4": "anthropic",
+                  "5": "openai", "6": "gemini", "s": "skip"}
         prov = by_num.get(choice, choice or data["AIOS_LLM_PROVIDER"])
 
         if prov in ("skip", "none", "s"):
@@ -938,6 +958,21 @@ def _wizard_env(args):
                         warn(f"could not launch the login: {e}")
                 else:
                     say(f"  {C.GRY}Run `aios claude-login` when you're ready.{C.R}")
+        elif prov in ("codex", "chatgpt", "openai-codex"):
+            cxp = cfg_get(load_config(), "services.codex.port", 8010)
+            data["AIOS_LLM_PROVIDER"] = "codex"
+            data["AIOS_LLM_BASE_URL"] = f"http://127.0.0.1:{cxp}/v1"
+            data["AIOS_LLM_API_KEY"] = "sk-aios-codex"     # placeholder; auth is the CLI
+            data["AIOS_DEFAULT_MODEL"] = "codex"
+            ok("using your ChatGPT/Codex subscription via the codex CLI")
+            cx = find_tool("codex")
+            if not cx:
+                warn("the `codex` CLI isn't installed yet — install it with:")
+                say(f"    {C.B}npm install -g @openai/codex{C.R}")
+                say(f"    {C.GRY}then run `codex login` to authorise your account.{C.R}")
+            else:
+                ok(f"found the codex CLI ({cx})")
+                say(f"  {C.GRY}If it isn't logged in yet, run `codex login`.{C.R}")
         else:
             data["AIOS_LLM_PROVIDER"] = prov
             data.pop("AIOS_LLM_BASE_URL", None)  # don't leave a stale claude-code URL
@@ -2517,7 +2552,7 @@ HELP_GROUPS = [
     ("Agents & updates", ["updates", "update", "claude-login", "ruflo", "attach", "migrate", "wire"]),
     ("Advanced", ["test", "debug", "autostart", "install-cli", "bootstrap", "uninstall"]),
 ]
-TAGLINE = "Nine open-source AI projects. One operating system."
+TAGLINE = "Ten open-source AI projects. One operating system."
 
 
 class AiosParser(argparse.ArgumentParser):
