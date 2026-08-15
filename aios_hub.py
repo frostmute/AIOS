@@ -35,6 +35,7 @@ import aios_sec as sec        # noqa: E402  the gate in front of full-control mo
 import aios_tools as tools    # noqa: E402  shell + channel/skill catalogs
 import aios_updates as updates  # noqa: E402  agent-supervised dependency updates
 import aios_web as web          # noqa: E402  YouTube / Reddit / HN / page readers
+import aios_swarm as swarm      # noqa: E402  decompose big tasks across agents
 
 PORT = int(os.environ.get("AIOS_HUB_PORT", "8787"))
 ROOT = Path(os.environ.get("AIOS_ROOT", Path(__file__).resolve().parent))
@@ -115,7 +116,7 @@ def read_system_prompt() -> str:
 
 
 # Chat "targets" the AIOS API exposes as OpenAI-style models.
-TARGETS = ["brain", "team", "opencode", "crewai", "claudecode", "fabric", "all"]
+TARGETS = ["brain", "team", "swarm", "opencode", "crewai", "claudecode", "fabric", "all"]
 
 MEMORY_FILE = ROOT / ".aios" / "memory.json"
 USAGE_FILE = ROOT / ".aios" / "usage.json"
@@ -320,7 +321,11 @@ def llm_chat(messages: list, system: str | None = None) -> str:
         headers={"Content-Type": "application/json", "Authorization": f"Bearer {key}",
                  "HTTP-Referer": "https://github.com/ZDStudios/AIOS", "X-Title": "The AI OS"})
     try:
-        with urllib.request.urlopen(req, timeout=120) as r:
+        # Generous: when the provider is claude-code, every call shells out to the
+        # Claude CLI, which cold-starts slowly. Swarm planning is a big prompt and
+        # was timing out at 120s, which surfaced as "no usable plan".
+        with urllib.request.urlopen(req, timeout=int(
+                os.environ.get("AIOS_LLM_TIMEOUT", "300"))) as r:
             data = json.loads(r.read())
         return data["choices"][0]["message"]["content"]
     except urllib.error.HTTPError as e:
@@ -621,6 +626,42 @@ def maybe_pin_to_canvas(user_msg: str, reply: str) -> str:
     return title
 
 
+# --------------------------------------------------------------------------- #
+# Swarm — a big request becomes a DAG of subtasks run by different specialists  #
+# in parallel, able to consult each other, then synthesized into one answer.    #
+# --------------------------------------------------------------------------- #
+SWARM_FILE = ROOT / ".aios" / "swarm.json"
+
+
+def swarm_enabled() -> bool:
+    return os.environ.get("AIOS_SWARM", "1") == "1"
+
+
+def swarm_state() -> dict:
+    return _load_json(SWARM_FILE, {})
+
+
+def run_swarm(message: str) -> dict:
+    """Bind the hub's router + activity feed into the swarm engine, and publish
+    live progress so the dashboard can watch the DAG fill in."""
+    def _publish(snap):
+        _save_json(SWARM_FILE, {**snap, "message": message[:400], "ts": time.time()})
+
+    r = swarm.run(
+        message,
+        route=lambda agent, prompt: route(agent, prompt),
+        ask_llm=lambda msgs, system=None: llm_chat(msgs, system=system),
+        act=act,
+        on_update=_publish,
+    )
+    _save_json(SWARM_FILE, {"summary": r.get("summary", ""), "tasks": r.get("tasks", []),
+                            "message": message[:400], "ts": time.time(),
+                            "elapsed": r.get("elapsed"), "finished": True})
+    if r.get("swarm"):
+        brain.audit("swarm", "run", f"{len(r.get('tasks', []))} subtasks: {message[:120]}")
+    return r
+
+
 def route(target: str, message: str, history: list | None = None) -> str:
     history = history or []
     target = (target or "brain").lower()
@@ -645,7 +686,20 @@ def route(target: str, message: str, history: list | None = None) -> str:
         if txt.strip():
             return run_fabric(pat.strip(), txt.strip())
         return run_fabric("summarize", message)
+    if target == "swarm":
+        r = run_swarm(message)
+        # A swarm that couldn't plan must not hand back an empty string — fall
+        # back to the team, which is a single round but always produces an answer.
+        return r.get("reply") or run_team(message, history)
     if target in ("team", "auto", "merge"):
+        # A genuinely big ask gets the swarm — parallel specialists that can
+        # consult each other — rather than run_team's single shallow round.
+        if swarm_enabled() and swarm.looks_big(message):
+            act("plan", "Big task detected — deploying a swarm of agents")
+            r = run_swarm(message)
+            if r.get("swarm") and r.get("reply"):
+                return r["reply"]
+            act("note", "Swarm unavailable — using the team instead.")
         return run_team(message, history)
     if target == "all":
         parts = []
@@ -1446,6 +1500,8 @@ class Handler(BaseHTTPRequestHandler):
         elif self.path == "/api/activity":
             self._send(200, activity(self._query.get("turn", [""])[0],
                                      int(self._query.get("since", ["0"])[0] or 0)))
+        elif self.path == "/api/swarm":
+            self._send(200, {**swarm_state(), "enabled": swarm_enabled()})
         elif self.path == "/api/dashboard":
             self._send(200, dashboard_cfg())
         elif self.path == "/api/updates":
@@ -1692,6 +1748,16 @@ class Handler(BaseHTTPRequestHandler):
             brain.audit(payload.get("by", "agent"), "web." + op,
                         f"{q[:120]} -> ok={r.get('ok')}")
             self._send(200, r)
+        elif self.path == "/api/swarm":
+            msg = payload.get("message", "")
+            if not msg:
+                self._send(400, {"error": "no message"})
+            else:
+                act_begin(payload.get("turn", ""))
+                try:
+                    self._send(200, run_swarm(msg))
+                finally:
+                    act_end()
         elif self.path == "/api/dashboard":
             self._send(200, dashboard_update(payload))
         elif self.path == "/api/updates":

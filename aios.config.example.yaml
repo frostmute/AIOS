@@ -83,6 +83,12 @@ updates:
                            # nothing executes) when an agent says SAFE. Service-tier
                            # projects with dependency trees always wait for you.
 
+swarm:
+  enabled: true            # big requests are decomposed into subtasks, run by
+                           # different specialist agents in parallel; agents can
+                           # consult each other mid-task, then one synthesizes.
+                           # Small asks are untouched (a cheap heuristic gates it).
+
 watchdog:
   enabled: true            # if an agent stops responding, auto-restart it
   interval: 45             # seconds between health sweeps; a healthy agent diagnoses failures

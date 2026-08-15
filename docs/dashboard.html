@@ -232,6 +232,7 @@
     <div class="sec">System</div>
     <button class="nav" data-v="memory" onclick="nav('memory')"><span class="ic">🧠</span> Memory</button>
     <button class="nav" data-v="channels" onclick="nav('channels')"><span class="ic">📡</span> Channels</button>
+    <button class="nav" data-v="swarm" onclick="nav('swarm')"><span class="ic">🐝</span> Swarm</button>
     <button class="nav" data-v="tasks" onclick="nav('tasks')"><span class="ic">⚙</span> Task Brain</button>
     <button class="nav" data-v="flows" onclick="nav('flows')"><span class="ic">🔀</span> TaskFlow</button>
     <button class="nav" data-v="skills" onclick="nav('skills')"><span class="ic">🎓</span> Skills</button>
@@ -266,6 +267,7 @@
             <button class="chip" data-t="crewai">👥 CrewAI</button>
             <button class="chip" data-t="opencode">⌨️ opencode</button>
             <button class="chip" data-t="claudecode">◈ claude-code</button>
+            <button class="chip" data-t="swarm" title="Big task: decompose across specialist agents running in parallel">🐝 Swarm</button>
             <button class="chip" data-t="fabric" title="Run a Fabric pattern (type: pattern: your text)">🧵 Fabric</button>
             <button class="chip" data-t="all">🌐 All</button>
           </div>
@@ -369,6 +371,20 @@
             <span style="color:var(--text3);font-size:12px;align-self:center">runs survive restarts; every run is recorded</span></div>
         </div>
         <div id="taskList" style="margin-top:14px"></div>
+      </div>
+    </div>
+
+    <!-- SWARM -->
+    <div id="swarm" class="view">
+      <div class="vhead"><h2>🐝 Swarm</h2><span class="sub">big tasks, split across specialists running in parallel</span></div>
+      <div class="vbody pad" style="max-width:920px">
+        <div class="card">
+          <h3>How it works</h3>
+          <p style="color:var(--text2)">A big request is decomposed into a <b>DAG of subtasks</b>, each assigned to the agent that suits it. Independent subtasks run <b>at the same time</b>; a subtask waits only for the ones it actually depends on. While running, an agent can <b>consult a peer</b> (<span class="mono">ASK opencode: …</span>) and gets a real answer back before finishing. One agent then synthesizes everything into a single reply.</p>
+          <p style="color:var(--text3);font-size:12.5px">Triggered automatically for big asks on <b>Brain</b>/<b>Team</b>, or force it with the <b>🐝 Swarm</b> chip. Small messages never pay for it.</p>
+          <div class="inrow" style="margin-top:10px"><input id="swarmMsg" placeholder="Give the team a big task…" onkeydown="if(event.key==='Enter')runSwarm()"><button class="btn primary" onclick="runSwarm()">Deploy swarm</button></div>
+        </div>
+        <div id="swarmLive" style="margin-top:14px"></div>
       </div>
     </div>
 
@@ -648,6 +664,7 @@
     if(v==='channels')loadChannels();
     if(v==='tasks')loadTasks();
     if(v==='flows')loadFlows();
+    if(v==='swarm')loadSwarm();
     if(v==='skills')loadSkillsView();
     if(v==='patterns')loadPatterns();
     if(v==='updates')loadUpdates();
@@ -866,6 +883,33 @@
     </div>`).join(''):'<p style="color:var(--text3)">No tasks yet. The Task Brain runs cron jobs, interval prompts, and shell commands on one scheduler.</p>';}catch(e){}}
   async function addTask(){const name=document.getElementById('tkName').value.trim()||'task';const kind=document.getElementById('tkKind').value;const body=document.getElementById('tkBody').value.trim();const cron=document.getElementById('tkSchedule').value.trim();const every=parseInt(document.getElementById('tkEvery').value)||0;const p={op:'add',name,kind,cron,every_minutes:every};if(kind==='agent'){p.target=document.getElementById('tkTarget').value.trim()||'brain';p.prompt=body;}else{p.command=body;}await api('/api/tasks',p);document.getElementById('tkName').value='';document.getElementById('tkBody').value='';toast('Task added');loadTasks();}
   async function taskOp(op,id){const r=await api('/api/tasks',{op,id});if(op==='run')toast('Ran: '+(r.status||''));loadTasks();}
+
+  // ── Swarm ──
+  const SW_ICON={waiting:'⏳',running:'⚡',done:'✅',error:'⛔'};
+  async function loadSwarm(){try{const r=await(await fetch('/api/swarm')).json();renderSwarm(r);}catch(e){}}
+  function renderSwarm(r){
+    const el=document.getElementById('swarmLive'); if(!el)return;
+    const ts=r.tasks||[];
+    if(!ts.length){el.innerHTML='<p style="color:var(--text3)">No swarm has run yet. Give the team something big above.</p>';return;}
+    const byId={}; ts.forEach(t=>byId[t.id]=t);
+    el.innerHTML=`<div class="card"><h3>${esc(r.summary||'Swarm')} ${r.finished?'<span class="badge up">finished</span>':'<span class="badge">running</span>'}${r.elapsed?` <span class="pill">${r.elapsed}s</span>`:''}</h3>
+      <p style="color:var(--text3);font-size:12.5px">${esc((r.message||'').slice(0,180))}</p>
+      <div style="margin-top:12px;display:flex;flex-direction:column;gap:8px">`+
+      ts.map(t=>`<div class="memrow" style="align-items:flex-start">
+        <span class="t"><b>${SW_ICON[t.status]||'•'} ${esc(t.title||t.id)}</b>
+          <span class="pill">${esc(t.agent)}</span>
+          ${(t.deps||[]).length?`<span class="pill" title="waits for">after ${esc((t.deps||[]).map(d=>(byId[d]||{}).title||d).join(', ')).slice(0,50)}</span>`:'<span class="pill">start</span>'}
+          ${t.error?`<div style="color:var(--danger);font-size:12px;margin-top:4px">${esc(t.error)}</div>`:''}
+          ${t.output?`<details style="margin-top:5px"><summary style="cursor:pointer;color:var(--text3);font-size:12px">output</summary><pre class="logbox" style="margin-top:6px">${esc((t.output||'').slice(0,2500))}</pre></details>`:''}
+        </span></div>`).join('')+'</div></div>';
+  }
+  async function runSwarm(){const m=document.getElementById('swarmMsg').value.trim(); if(!m)return;
+    toast('Swarm deploying — planning and assigning agents…');
+    const poll=setInterval(loadSwarm,1500);
+    try{ const r=await api('/api/swarm',{message:m});
+      clearInterval(poll); await loadSwarm();
+      toast(r.swarm?`Swarm done — ${(r.tasks||[]).length} subtasks`:'One agent was enough for that');
+    }catch(e){ clearInterval(poll); toast('Swarm failed: '+e); }}
 
   // ── TaskFlow ──
   async function loadFlows(){try{const r=await(await fetch('/api/flows')).json();const fs=r.flows||[];document.getElementById('flowList').innerHTML=fs.length?fs.map(f=>`

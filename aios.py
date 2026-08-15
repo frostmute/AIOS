@@ -478,6 +478,7 @@ def service_specs(cfg: dict) -> dict:
             "AIOS_WATCHDOG": "1" if cfg_get(cfg, "watchdog.enabled", True) else "0",
             "AIOS_WATCHDOG_INTERVAL": str(cfg_get(cfg, "watchdog.interval", 45)),
             # supervised updates: agents review upstream changes before they land
+            "AIOS_SWARM": "1" if cfg_get(cfg, "swarm.enabled", True) else "0",
             "AIOS_SUPERVISED_UPDATES": "1" if cfg_get(cfg, "updates.supervised", True) else "0",
             "AIOS_UPDATE_INTERVAL": str(cfg_get(cfg, "updates.check_interval", 21600)),
             "AIOS_AUTO_APPLY": "1" if cfg_get(cfg, "updates.auto_apply_safe", True) else "0",
