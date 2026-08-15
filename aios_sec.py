@@ -204,11 +204,35 @@ def _rm_wipes_root(cmd: str) -> bool:
     return False
 
 
+# The master-password vault. Agents have a shell, so this is the sanctioned route
+# to the filesystem — closing it is what makes "the AI can't delete my password"
+# meaningful in practice. Deleting it still wouldn't UNLOCK anything (the vault
+# fails closed), but there's no reason to let them try.
+_VAULT_HINTS = re.compile(
+    r"(\.aios[/\\]vault\.json|\.aios-vault|aios_vault\.py|[/\\]vault\.json)", re.I)
+
+
+def _touches_vault(cmd: str) -> bool:
+    if not _VAULT_HINTS.search(cmd or ""):
+        return False
+    # Reading it is harmless (it holds only a salted hash); writing/removing isn't.
+    return bool(re.search(r"\b(rm|del|erase|unlink|shred|mv|move|ren|rename|truncate|"
+                          r"chmod|chown|icacls|attrib|tee|dd)\b|>\s*|>>\s*|"
+                          r"Remove-Item|Set-Content|Add-Content|Out-File|Clear-Content",
+                          cmd or "", re.I))
+
+
 def guard(cmd: str, enabled: bool = True) -> tuple[bool, str]:
     """(allowed, reason). Blocks commands that destroy the host rather than do the task."""
+    c = " ".join((cmd or "").split())
+    # Checked BEFORE the guardrails-enabled switch, deliberately: disabling the
+    # guardrails is itself a vault-protected operation, so if turning them off
+    # also unlocked deleting the vault, the protection would be circular.
+    if _touches_vault(c):
+        return False, ("modifying or deleting the AIOS master-password vault "
+                       "(protected — do this yourself with `aios password`)")
     if not enabled:
         return True, ""
-    c = " ".join((cmd or "").split())
     if _rm_wipes_root(c):
         return False, "recursive delete of a root path"
     for rx, why in _COMPILED:

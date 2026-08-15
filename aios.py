@@ -820,6 +820,7 @@ def cmd_setup(args):
 
     # 7b) hand the agents the machine, and mint the token that keeps that safe
     ensure_hub_token()
+    ensure_master_password(interactive=not args.non_interactive)
     if not args.skip_wire:
         wire_full_control(cfg)
 
@@ -1952,6 +1953,183 @@ def cmd_web(args):
         print(json.dumps(r, indent=2)[:12000])
 
 
+def _vault():
+    sys.path.insert(0, str(ROOT))
+    import aios_vault
+    return aios_vault
+
+
+def _ask_password(prompt: str = "Master password: ") -> str:
+    """Read a password without echoing it.
+
+    getpass() on Windows reads the console device directly and ignores a pipe,
+    so `echo pw | aios uninstall` would hang forever rather than fail. When stdin
+    isn't a terminal, read the line instead — that keeps it scriptable and, more
+    importantly, means it can never hang."""
+    if not sys.stdin.isatty():
+        line = sys.stdin.readline()
+        if not line:
+            return ""
+        return line.rstrip("\r\n")
+    import getpass
+    try:
+        return getpass.getpass(prompt)
+    except Exception:
+        return input(prompt)
+
+
+def ensure_master_password(interactive: bool = True) -> bool:
+    """Offered once at setup. Gates uninstall and other irreversible operations."""
+    V = _vault()
+    if V.is_set():
+        return True
+    if not interactive or not sys.stdin.isatty():
+        warn("no master password set — `aios uninstall` and other protected "
+             "operations will refuse until you run `aios password set`")
+        return False
+    head("Master password")
+    say("  Sets a password required to UNINSTALL The AI OS or disable its guardrails.")
+    say(f"  {C.GRY}Stored as a memory-hard scrypt hash — never in plain text, so it")
+    say(f"  cannot be read back. Deleting it does not bypass anything: protected")
+    say(f"  operations refuse when the vault is missing.{C.R}\n")
+    for _ in range(3):
+        p1 = _ask_password("  Choose a master password (min 8 chars, blank to skip): ")
+        if not p1.strip():
+            warn("skipped — set one later with `aios password set`")
+            return False
+        p2 = _ask_password("  Confirm: ")
+        if p1 != p2:
+            warn("passwords didn't match — try again")
+            continue
+        r = V.set_password(p1)
+        if r.get("ok"):
+            ok("master password set")
+            say(f"  {C.GRY}stored (hashed) at {V.VAULT} and mirrored to {V.MIRROR}{C.R}")
+            return True
+        warn(r.get("error", "could not set password"))
+    return False
+
+
+def cmd_password(args):
+    V = _vault()
+    action = getattr(args, "action", "status")
+    if action == "status":
+        st = V.status()
+        head("Master password")
+        say(f"  set        : {C.GRN if st['set'] else C.YEL}{st['set']}{C.R}")
+        say(f"  primary    : {st['primary']}  {C.GRY}{st['paths']['primary']}{C.R}")
+        say(f"  mirror     : {st['mirror']}  {C.GRY}{st['paths']['mirror']}{C.R}")
+        if st.get("tampered"):
+            warn("a copy is corrupt or was edited — protected operations will refuse")
+        if st.get("mismatch"):
+            warn("the two copies disagree — compare them and remove the wrong one")
+        if not st["set"]:
+            say(f"\n  {C.GRY}Set one with:{C.R} aios password set")
+        return
+    if action == "set":
+        if V.is_set():
+            cur = _ask_password("Current master password: ")
+        else:
+            cur = None
+        for _ in range(3):
+            p1 = _ask_password("New master password (min 8 chars): ")
+            p2 = _ask_password("Confirm: ")
+            if p1 != p2:
+                warn("passwords didn't match")
+                continue
+            r = V.set_password(p1, current=cur)
+            (ok if r.get("ok") else warn)(
+                ("rotated" if r.get("rotated") else "master password set")
+                if r.get("ok") else r.get("error"))
+            return
+        return
+    if action == "verify":
+        r = V.verify(_ask_password())
+        (ok if r.get("ok") else warn)("correct" if r.get("ok") else r.get("error"))
+        sys.exit(0 if r.get("ok") else 1)
+
+
+def cmd_uninstall(args):
+    """Remove The AI OS. Protected by the master password, and never silent."""
+    V = _vault()
+    head("Uninstall The AI OS")
+
+    st = V.status()
+    if not st["set"]:
+        warn("no master password is set, so uninstall is refused.")
+        say(f"  {C.GRY}This is deliberate: a missing vault must never unlock a "
+            f"destructive action.{C.R}")
+        say(f"  {C.GRY}Set one with `aios password set`, or remove the folder "
+            f"manually if you've lost it.{C.R}")
+        sys.exit(1)
+
+    r = V.require(_ask_password("Master password: "), "uninstall")
+    if not r.get("ok"):
+        warn(r.get("error", "incorrect password"))
+        sys.exit(1)
+    ok("password accepted")
+
+    keep_data = not getattr(args, "purge", False)
+    say(f"\n{C.B}This will:{C.R}")
+    say("  · stop every AIOS service")
+    say("  · remove the global `aios` command and any autostart entry")
+    say(f"  · {'KEEP' if keep_data else 'DELETE'} your state in .aios/ "
+        f"(memory, tasks, flows, audit log){'' if keep_data else '  ← --purge'}")
+    say(f"  · {C.GRY}leave the project folder itself — delete it yourself when happy{C.R}")
+    if not getattr(args, "yes", False):
+        if input(f"\n{C.YEL}Type 'uninstall' to confirm: {C.R}").strip().lower() != "uninstall":
+            say("aborted — nothing changed.")
+            return
+
+    head("Stopping services")
+    try:
+        cmd_stop(argparse.Namespace(service=["all"]))
+    except Exception as e:
+        warn(f"stop reported: {e}")
+
+    head("Removing integration")
+    try:
+        cmd_autostart(argparse.Namespace(action="disable"))
+    except Exception as e:
+        warn(f"autostart: {e}")
+    try:
+        install_cli_remove()
+    except Exception as e:
+        warn(f"cli shim: {e}")
+
+    if not keep_data:
+        head("Deleting state")
+        for p in (STATE, V.MIRROR.parent):
+            try:
+                if p.exists():
+                    shutil.rmtree(p, ignore_errors=True)
+                    ok(f"removed {p}")
+            except Exception as e:
+                warn(f"could not remove {p}: {e}")
+
+    say()
+    ok("The AI OS is uninstalled.")
+    say(f"  {C.GRY}The project folder is still at {ROOT} — delete it when you're ready.{C.R}")
+    if keep_data:
+        say(f"  {C.GRY}Your state was kept in {STATE} (use --purge to delete it too).{C.R}")
+
+
+def install_cli_remove():
+    """Undo install_cli()."""
+    d = _cli_bin_dir()
+    removed = []
+    for name in ("aios", "aios.cmd", "aios.ps1"):
+        p = d / name
+        try:
+            if p.exists():
+                p.unlink()
+                removed.append(str(p))
+        except Exception:
+            pass
+    (ok if removed else warn)(f"removed CLI shim(s): {', '.join(removed)}" if removed
+                              else "no CLI shim found on PATH")
+
+
 def cmd_updates(args):
     """Supervised updates: what moved upstream, what the agents think, apply/rollback."""
     sys.path.insert(0, str(ROOT))
@@ -2201,9 +2379,9 @@ def _print_urls(cfg):
 # unreadable once you have 25 subcommands.
 HELP_GROUPS = [
     ("Get started", ["setup", "start", "stop", "restart", "status", "url"]),
-    ("Everyday", ["logs", "doctor", "exec", "web", "channels", "profile", "token"]),
+    ("Everyday", ["logs", "doctor", "exec", "web", "channels", "profile", "token", "password"]),
     ("Agents & updates", ["updates", "update", "claude-login", "ruflo", "attach", "migrate", "wire"]),
-    ("Advanced", ["test", "debug", "autostart", "install-cli", "bootstrap"]),
+    ("Advanced", ["test", "debug", "autostart", "install-cli", "bootstrap", "uninstall"]),
 ]
 TAGLINE = "Nine open-source AI projects. One operating system."
 
@@ -2350,6 +2528,15 @@ def build_parser():
     s.add_argument("args", nargs=argparse.REMAINDER,
                    help="passed to `npx ruflo` — or: plugins | mcp-register")
     s.set_defaults(func=cmd_ruflo)
+
+    s = sub.add_parser("password", help="master password that gates uninstall + guardrail changes")
+    s.add_argument("action", nargs="?", choices=["status", "set", "verify"], default="status")
+    s.set_defaults(func=cmd_password)
+
+    s = sub.add_parser("uninstall", help="remove The AI OS (requires the master password)")
+    s.add_argument("--purge", action="store_true", help="also delete .aios state (memory, tasks, audit)")
+    s.add_argument("--yes", action="store_true", help="skip the typed confirmation")
+    s.set_defaults(func=cmd_uninstall)
 
     s = sub.add_parser("token", help="print the hub token (needed for non-loopback access)")
     s.add_argument("--rotate", action="store_true", help="generate a fresh token")

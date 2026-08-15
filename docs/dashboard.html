@@ -248,6 +248,7 @@
     <button class="nav" data-v="flows" onclick="nav('flows')"><span class="ic">🔀</span> TaskFlow</button>
     <button class="nav" data-v="skills" onclick="nav('skills')"><span class="ic">🎓</span> Skills</button>
     <button class="nav" data-v="patterns" onclick="nav('patterns')"><span class="ic">🧵</span> Patterns</button>
+    <button class="nav" data-v="plugins" onclick="nav('plugins')"><span class="ic">🧱</span> Plugin Store</button>
     <button class="nav" data-v="automations" onclick="nav('automations')"><span class="ic">⏰</span> Automations</button>
     <button class="nav" data-v="updates" onclick="nav('updates')"><span class="ic">⬆️</span> Updates</button>
     <button class="nav" data-v="actions" onclick="nav('actions')"><span class="ic">👁</span> Live Actions</button>
@@ -469,6 +470,16 @@
         </div>
         <div id="updList" style="margin-top:14px"></div>
         <div class="card" style="margin-top:14px"><h3>Version pins</h3><div id="updPins" style="margin-top:10px"></div></div>
+      </div>
+    </div>
+
+    <!-- PLUGIN STORE -->
+    <div id="plugins" class="view">
+      <div class="vhead"><h2>🧱 Plugin Store</h2><span class="sub">channels, ruflo packs, skills — everything installable</span></div>
+      <div class="vbody pad">
+        <div class="inrow" style="max-width:520px"><input id="plugFilter" placeholder="Search plugins…" oninput="renderPlugins()"></div>
+        <div class="row" style="margin-top:8px;gap:6px;flex-wrap:wrap" id="plugKinds"></div>
+        <div id="plugGrid" class="chan-grid" style="margin-top:14px"></div>
       </div>
     </div>
 
@@ -751,6 +762,7 @@
     if(v==='actions'){setWatchUI();renderActions();if(watchOn)pollActions();}
     if(v==='skills')loadSkillsView();
     if(v==='patterns')loadPatterns();
+    if(v==='plugins')loadPlugins();
     if(v==='updates')loadUpdates();
     if(v==='security'){loadSecurity();loadAudit();}
     if(v==='settings'){loadSettings();loadSysPrompt();loadModels();renderThemeStore();loadClaudeStatus();try{renderDashState();}catch(e){}}
@@ -1086,6 +1098,41 @@
       : 'No agent changes active — showing the theme as-is.';}
   async function resetDash(what){if(!confirm('Reset the dashboard '+(what==='all'?'appearance and panels':what)+' to defaults?'))return;
     await api('/api/dashboard',{op:'reset',what:what||'all'});loadDashCfg(true);toast('Dashboard reset');}
+
+  // ── Plugin store ──
+  let PLUGINS=[], plugKind='all';
+  const PK={channel:'📡',ruflo:'🤖',skill:'🎓',openclaw:'🦞'};
+  async function loadPlugins(){try{const r=await(await fetch('/api/plugins')).json();PLUGINS=r.plugins||[];renderKinds();renderPlugins();}catch(e){document.getElementById('plugGrid').innerHTML='<p style="color:var(--text3)">Store unavailable.</p>';}}
+  function renderKinds(){
+    const counts={}; PLUGINS.forEach(p=>counts[p.kind]=(counts[p.kind]||0)+1);
+    const el=document.getElementById('plugKinds'); if(!el)return;
+    el.innerHTML=[['all','all',PLUGINS.length]].concat(Object.entries(counts).map(([k,n])=>[k,(PK[k]||'')+' '+k,n]))
+      .map(([k,label,n])=>`<button class="btn sm ${plugKind===k?'primary':''}" onclick="plugKind='${k}';renderKinds();renderPlugins()">${esc(label)} (${n})</button>`).join('');
+  }
+  function renderPlugins(){
+    const q=(document.getElementById('plugFilter').value||'').toLowerCase();
+    const list=PLUGINS.filter(p=>(plugKind==='all'||p.kind===plugKind)&&
+      (!q||p.name.toLowerCase().includes(q)||(p.blurb||'').toLowerCase().includes(q)));
+    const g=document.getElementById('plugGrid');
+    g.innerHTML=list.slice(0,150).map(p=>`<div class="chan ${p.installed?'on':''}">
+      <div class="chan-h"><b>${PK[p.kind]||''} ${esc(p.name)}</b>${p.installed?'<span class="badge up">installed</span>':`<span class="pill">${esc(p.kind)}</span>`}</div>
+      <p>${esc((p.blurb||'').slice(0,120))}</p>
+      ${p.skills?`<div class="chan-note">${p.skills} skill(s)</div>`:''}
+      ${p.env&&p.env.length?`<div class="chan-note">needs ${esc(p.env.slice(0,2).join(', '))}</div>`:''}
+      <div style="display:flex;gap:6px;margin-top:auto">
+        ${p.installed
+          ? (p.bundled?'<span class="chan-note">bundled</span>':`<button class="btn sm danger" onclick="plugOp('uninstall','${esc(p.id)}')">Remove</button>`)
+          : (p.kind==='channel'?`<button class="btn sm" onclick="nav('channels')">Configure →</button>`
+                               :`<button class="btn sm primary" onclick="plugOp('install','${esc(p.id)}')">Install</button>`)}
+      </div></div>`).join('')||'<p style="color:var(--text3)">No match.</p>';
+  }
+  async function plugOp(op,id){
+    if(op==='uninstall'&&!confirm('Remove '+id+'?'))return;
+    toast(op==='install'?('Installing '+id+' — this can take a minute'):'Removing '+id);
+    const r=await api('/api/plugins',{op,id});
+    toast(r.ok?(op==='install'?'Installed':'Removed')+': '+id:(r.error||'failed'));
+    loadPlugins();
+  }
 
   // ── Live action monitor: every action the agents take, streamed ──
   // Cursor-based, so reconnecting or switching views never replays old rows.

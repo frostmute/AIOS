@@ -36,6 +36,8 @@ import aios_tools as tools    # noqa: E402  shell + channel/skill catalogs
 import aios_updates as updates  # noqa: E402  agent-supervised dependency updates
 import aios_web as web          # noqa: E402  YouTube / Reddit / HN / page readers
 import aios_swarm as swarm      # noqa: E402  decompose big tasks across agents
+import aios_plugins as plugins  # noqa: E402  the plugin store
+import aios_vault as vault      # noqa: E402  master password for destructive ops
 
 PORT = int(os.environ.get("AIOS_HUB_PORT", "8787"))
 ROOT = Path(os.environ.get("AIOS_ROOT", Path(__file__).resolve().parent))
@@ -1500,6 +1502,10 @@ class Handler(BaseHTTPRequestHandler):
         elif self.path == "/api/activity":
             self._send(200, activity(self._query.get("turn", [""])[0],
                                      int(self._query.get("since", ["0"])[0] or 0)))
+        elif self.path == "/api/plugins":
+            self._send(200, {"plugins": plugins.catalog()})
+        elif self.path == "/api/vault":
+            self._send(200, vault.status())   # never returns anything secret
         elif self.path == "/api/actions":
             # Cursor-based so the live monitor never re-sends what it already has.
             since = int(self._query.get("since", ["0"])[0] or 0)
@@ -1762,6 +1768,32 @@ class Handler(BaseHTTPRequestHandler):
             brain.audit(payload.get("by", "agent"), "web." + op,
                         f"{q[:120]} -> ok={r.get('ok')}")
             self._send(200, r)
+        elif self.path == "/api/plugins":
+            op = payload.get("op", "install")
+            pid = payload.get("id", "")
+            if op == "install":
+                r = plugins.install(pid, payload)
+            elif op == "uninstall":
+                r = plugins.uninstall(pid)
+            else:
+                r = {"ok": False, "error": "unknown op"}
+            brain.audit("hub", "plugin." + op, f"{pid} -> ok={r.get('ok')}")
+            self._send(200, r)
+        elif self.path == "/api/vault":
+            # Set or rotate from the dashboard. Verification happens server-side;
+            # the password is never stored, logged, or echoed back.
+            op = payload.get("op", "status")
+            if op == "set":
+                r = vault.set_password(payload.get("password", ""),
+                                       current=payload.get("current"))
+                brain.audit("hub", "vault.set", f"ok={r.get('ok')}")
+                self._send(200, {k: v for k, v in r.items()})
+            elif op == "verify":
+                r = vault.verify(payload.get("password", ""))
+                brain.audit("hub", "vault.verify", f"ok={r.get('ok')}", ok=r.get("ok", False))
+                self._send(200, {"ok": r.get("ok", False), "error": r.get("error", "")})
+            else:
+                self._send(200, vault.status())
         elif self.path == "/api/swarm":
             msg = payload.get("message", "")
             if not msg:
