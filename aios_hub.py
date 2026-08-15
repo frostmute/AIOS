@@ -1500,6 +1500,17 @@ class Handler(BaseHTTPRequestHandler):
         elif self.path == "/api/activity":
             self._send(200, activity(self._query.get("turn", [""])[0],
                                      int(self._query.get("since", ["0"])[0] or 0)))
+        elif self.path == "/api/actions":
+            # Cursor-based so the live monitor never re-sends what it already has.
+            since = int(self._query.get("since", ["0"])[0] or 0)
+            fresh = brain.audit_since(since, 300)
+            self._send(200, {
+                "actions": fresh,
+                "cursor": (fresh[-1]["id"] if fresh else max(since, brain.audit_max_id())),
+                "running": tools.inflight(),
+                "full_control": tools.full_control(),
+                "guardrails": tools.guardrails_on(),
+            })
         elif self.path == "/api/swarm":
             self._send(200, {**swarm_state(), "enabled": swarm_enabled()})
         elif self.path == "/api/dashboard":
@@ -1729,6 +1740,7 @@ class Handler(BaseHTTPRequestHandler):
             # an agent never has to hand-roll scraping.
             op = (payload.get("op") or "fetch").lower()
             q = payload.get("url") or payload.get("query") or payload.get("target") or ""
+            _tr = tools._inflight_add(payload.get("by", "agent"), "web", f"{op} {q}"[:200])
             try:
                 if op in ("youtube", "yt"):
                     r = web.youtube(q, want_transcript=payload.get("transcript", True),
@@ -1745,6 +1757,8 @@ class Handler(BaseHTTPRequestHandler):
                     r = web.fetch(q, max_chars=int(payload.get("max_chars", 20000)))
             except Exception as e:
                 r = {"ok": False, "error": f"{op} failed: {e}"}
+            finally:
+                tools._inflight_done(_tr)
             brain.audit(payload.get("by", "agent"), "web." + op,
                         f"{q[:120]} -> ok={r.get('ok')}")
             self._send(200, r)

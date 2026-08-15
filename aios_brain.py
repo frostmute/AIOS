@@ -199,6 +199,22 @@ def audit_tail(n: int = 100) -> list[dict]:
         return [dict(r) for r in rows]
 
 
+def audit_since(after_id: int = 0, limit: int = 200) -> list[dict]:
+    """Rows newer than a cursor, oldest-first — for a live stream that never
+    re-sends what the client already has. `id` is the cursor."""
+    with _lock:
+        rows = db().execute(
+            "SELECT * FROM audit WHERE id > ? ORDER BY id ASC LIMIT ?",
+            (int(after_id or 0), limit)).fetchall()
+        return [dict(r) for r in rows]
+
+
+def audit_max_id() -> int:
+    with _lock:
+        r = db().execute("SELECT COALESCE(MAX(id), 0) m FROM audit").fetchone()
+        return int(r["m"] if r else 0)
+
+
 # --------------------------------------------------------------------------- #
 # Task Brain — cron + interval + agent prompts + background CLI, one scheduler #
 # --------------------------------------------------------------------------- #

@@ -192,6 +192,16 @@
   #slot-top:not(:empty){padding:12px 20px 0}
   #slot-sidebar:not(:empty){padding:10px}
   #slot-chat:not(:empty){padding:8px 0}
+  .actionfeed{max-height:60vh;overflow:auto;font-size:.78rem;font-family:ui-monospace,Menlo,Consolas,monospace}
+  .actrow{display:flex;gap:10px;padding:6px 12px;border-bottom:1px solid var(--border);align-items:baseline}
+  .actrow:last-child{border-bottom:0}
+  .actrow.bad{background:var(--danger-bg)}
+  .actrow .at{color:var(--text3);flex:0 0 auto}
+  .actrow .ai{flex:0 0 auto}
+  .actrow .aa{color:var(--accent-strong);flex:0 0 auto;min-width:56px}
+  .actrow .ak{color:var(--text2);flex:0 0 auto;min-width:96px}
+  .actrow .ad{color:var(--text);flex:1;word-break:break-word}
+  #watchBtn.primary{background:var(--accent);color:var(--bg);border-color:var(--accent)}
   .patlist{max-height:62vh;overflow:auto;border:1px solid var(--border);border-radius:10px}
   .patrow{padding:9px 12px;border-bottom:1px solid var(--border);cursor:pointer;display:flex;flex-direction:column;gap:2px}
   .patrow:last-child{border-bottom:0}
@@ -208,6 +218,7 @@
   <div class="brand"><span class="logo">◆</span> The AI OS <small>Workspace</small></div>
   <div class="top-actions">
     <button class="btn sm" onclick="act('restart')">↻ Restart all</button>
+    <button id="watchBtn" class="btn" onclick="toggleWatch()" title="Live action monitor — see everything the agents do on this machine">👁 Actions: off</button>
     <select id="themeSel" onchange="applyTheme(this.value)" title="Theme" style="padding:7px 10px;font-size:.82rem"></select>
   </div>
 </header>
@@ -239,6 +250,7 @@
     <button class="nav" data-v="patterns" onclick="nav('patterns')"><span class="ic">🧵</span> Patterns</button>
     <button class="nav" data-v="automations" onclick="nav('automations')"><span class="ic">⏰</span> Automations</button>
     <button class="nav" data-v="updates" onclick="nav('updates')"><span class="ic">⬆️</span> Updates</button>
+    <button class="nav" data-v="actions" onclick="nav('actions')"><span class="ic">👁</span> Live Actions</button>
     <button class="nav" data-v="security" onclick="nav('security')"><span class="ic">🛡️</span> Control &amp; Audit</button>
     <button class="nav" data-v="settings" onclick="nav('settings')"><span class="ic">⚙️</span> Settings</button>
     <div id="slot-sidebar" class="panelslot"></div>
@@ -460,6 +472,27 @@
       </div>
     </div>
 
+    <!-- LIVE ACTIONS -->
+    <div id="actions" class="view">
+      <div class="vhead"><h2>👁 Live Actions</h2><span class="sub">everything the agents do on this machine, as it happens</span></div>
+      <div class="vbody pad" style="max-width:980px">
+        <div class="card">
+          <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
+            <button id="watchBtn2" class="btn primary" onclick="toggleWatch()">👁 Start watching</button>
+            <label style="display:flex;gap:6px;align-items:center;cursor:pointer;font-size:13px"><input type="checkbox" id="watchAutoscroll" checked style="width:auto"> auto-scroll</label>
+            <label style="display:flex;gap:6px;align-items:center;cursor:pointer;font-size:13px"><input type="checkbox" id="watchOnlyShell" onchange="renderActions()" style="width:auto"> only commands</label>
+            <button class="btn sm" onclick="clearActions()">Clear view</button>
+            <span id="watchStat" style="color:var(--text3);font-size:12px;margin-left:auto"></span>
+          </div>
+          <p style="color:var(--text3);font-size:12.5px;margin-top:10px">Every shell command, web read, dashboard change, config write and blocked attempt — with who asked for it. <b>Running</b> actions appear the moment they start, not when they finish.</p>
+        </div>
+        <div id="runningNow" style="margin-top:12px"></div>
+        <div class="card" style="margin-top:12px;padding:0">
+          <div id="actionFeed" class="actionfeed"></div>
+        </div>
+      </div>
+    </div>
+
     <!-- CONTROL & AUDIT -->
     <div id="security" class="view">
       <div class="vhead"><h2>🛡️ Control &amp; Audit</h2><span class="sub">full machine control, gated and logged</span></div>
@@ -571,8 +604,16 @@
           <h3>🎨 Theme store</h3>
           <p>Pick a theme, or install your own — paste a JSON of CSS variables. Themes are saved in your browser.</p>
           <div id="themeGrid" style="display:grid;grid-template-columns:repeat(auto-fill,minmax(148px,1fr));gap:10px;margin-top:14px"></div>
-          <div class="field" style="margin-top:16px"><label>Install a custom theme (JSON)</label><textarea id="themeJson" rows="4" class="mono" style="font-size:.78rem" placeholder='{"name":"mytheme","label":"My Theme","dark":true,"vars":{"--bg":"#101010","--accent":"#ff6600"}}'></textarea></div>
-          <div class="row"><button class="btn primary" onclick="installTheme()">Install theme</button><a onclick="copyThemeTemplate()" style="cursor:pointer;color:var(--accent-strong);font-size:.8rem">use current theme as a template</a></div>
+          <div class="field" style="margin-top:16px"><label>Install a theme — paste <b>CSS</b> or JSON</label>
+            <textarea id="themeJson" rows="6" class="mono" style="font-size:.78rem" placeholder='/* name: neon */
+:root{
+  --bg:#0b0f14; --surface:#121822; --text:#e6f1ff;
+  --accent:#00e5ff; --border:#1e2a38;
+}
+
+...or JSON: {"name":"neon","vars":{"--bg":"#0b0f14"}}'></textarea>
+            <div class="hint">Paste a <span class="mono">:root{…}</span> block someone shared and it installs. Light/dark is detected from <span class="mono">--bg</span>; name it with <span class="mono">/* name: … */</span>.</div></div>
+          <div class="row"><button class="btn primary" onclick="installTheme()">Install theme</button><a onclick="copyCssTemplate()" style="cursor:pointer;color:var(--accent-strong);font-size:.8rem">use current theme as a template</a></div>
         </div>
 
         <div class="card">
@@ -639,7 +680,49 @@
     g.innerHTML=Object.entries(th).map(([k,t])=>{const v=t.vars;return `<div onclick="applyTheme('${k}')" title="${t.label}" style="cursor:pointer;border:2px solid ${k===cur?v['--accent']:'var(--border)'};border-radius:10px;overflow:hidden">
       <div style="height:44px;background:${v['--bg']};position:relative"><span style="position:absolute;bottom:7px;left:8px;width:20px;height:20px;border-radius:50%;background:${v['--accent']}"></span><span style="position:absolute;bottom:9px;left:32px;width:44px;height:8px;border-radius:4px;background:${v['--border-strong']}"></span></div>
       <div style="padding:7px 9px;font-size:.78rem;font-weight:600;color:${v['--text']};background:${v['--surface']}">${t.label}${k===cur?' ✓':''}${customThemes()[k]?' <span onclick="event.stopPropagation();delTheme(\''+k+'\')" style="float:right;color:'+v['--danger']+';cursor:pointer">✕</span>':''}</div></div>`;}).join('');}
-  function installTheme(){try{const o=JSON.parse(document.getElementById('themeJson').value);if(!o.name||!o.vars)throw new Error('needs "name" and "vars"');const c=customThemes();c[o.name]={label:o.label||o.name,dark:!!o.dark,vars:o.vars};localStorage.aiosCustomThemes=JSON.stringify(c);renderThemeSelect();applyTheme(o.name);document.getElementById('themeJson').value='';toast('Theme installed: '+(o.label||o.name));}catch(e){toast('Invalid theme JSON — '+e.message);}}
+  // Accepts EITHER the JSON shape or plain CSS, because themes get shared as CSS
+  // — people paste a `:root{--accent:…}` block from a gist, not a JSON object.
+  function parseCssTheme(text){
+    const vars={};
+    // Pull declarations out of :root / [data-theme] blocks, or a bare list.
+    const body=(text.match(/(?:^|})[^{}]*\{([^}]*)\}/g)||[]).join(';')||text;
+    body.replace(/(--[A-Za-z0-9_-]+)\s*:\s*([^;{}]+)/g,(m,k,v)=>{vars[k.trim()]=v.trim();return m;});
+    if(!Object.keys(vars).length)return null;
+    // Name from a /* name: X */ comment, else derive one.
+    const nm=(text.match(/\/\*\s*(?:theme[- ]?)?name\s*:\s*([^*]+)\*\//i)||[])[1];
+    const lbl=(text.match(/\/\*\s*label\s*:\s*([^*]+)\*\//i)||[])[1];
+    // Dark vs light: judge by the background's brightness rather than asking.
+    const bg=(vars['--bg']||'#111').trim();
+    let dark=true;
+    const hex=bg.match(/^#?([0-9a-f]{6})$/i)||bg.match(/^#?([0-9a-f]{3})$/i);
+    if(hex){let h=hex[1];if(h.length===3)h=h.split('').map(c=>c+c).join('');
+      const [r,g,b]=[0,2,4].map(i=>parseInt(h.substr(i,2),16));
+      dark=(0.2126*r+0.7152*g+0.0722*b)<128;}
+    const name=(nm||'custom-'+Object.keys(vars).length+'-'+Date.now().toString(36).slice(-4)).trim()
+      .toLowerCase().replace(/[^a-z0-9_-]+/g,'-');
+    return {name,label:(lbl||nm||'Custom theme').trim(),dark,vars};
+  }
+  function installTheme(){
+    const raw=(document.getElementById('themeJson').value||'').trim();
+    if(!raw){toast('Paste a theme (JSON or CSS) first');return;}
+    let o=null,how='';
+    try{ o=JSON.parse(raw); how='JSON'; if(!o.name||!o.vars)throw new Error('needs "name" and "vars"'); }
+    catch(e){ o=parseCssTheme(raw); how='CSS';
+      if(!o){toast(raw[0]==='{'?('Invalid theme JSON — '+e.message):'No CSS variables found — the theme needs --bg, --accent, …');return;} }
+    const c=customThemes();
+    c[o.name]={label:o.label||o.name,dark:!!o.dark,vars:o.vars};
+    localStorage.aiosCustomThemes=JSON.stringify(c);
+    renderThemeSelect(); applyTheme(o.name);
+    document.getElementById('themeJson').value='';
+    try{renderThemeStore();}catch(e2){}
+    toast(`Theme installed from ${how}: ${o.label||o.name} (${Object.keys(o.vars).length} vars)`);
+  }
+  function copyCssTemplate(){
+    const cur=allThemes()[localStorage.aiosTheme||'hermes'];
+    document.getElementById('themeJson').value=
+      `/* name: my-theme */\n/* label: My Theme */\n:root{\n`+
+      Object.entries(cur.vars).map(([k,v])=>`  ${k}: ${v};`).join('\n')+`\n}`;
+  }
   function delTheme(k){const c=customThemes();delete c[k];localStorage.aiosCustomThemes=JSON.stringify(c);if(localStorage.aiosTheme===k)applyTheme('hermes');renderThemeSelect();renderThemeStore();}
   function copyThemeTemplate(){const cur=allThemes()[localStorage.aiosTheme||'hermes'];document.getElementById('themeJson').value=JSON.stringify({name:'mytheme',label:'My Theme',dark:cur.dark,vars:cur.vars},null,2);}
   renderThemeSelect();
@@ -665,6 +748,7 @@
     if(v==='tasks')loadTasks();
     if(v==='flows')loadFlows();
     if(v==='swarm')loadSwarm();
+    if(v==='actions'){setWatchUI();renderActions();if(watchOn)pollActions();}
     if(v==='skills')loadSkillsView();
     if(v==='patterns')loadPatterns();
     if(v==='updates')loadUpdates();
@@ -1003,6 +1087,61 @@
   async function resetDash(what){if(!confirm('Reset the dashboard '+(what==='all'?'appearance and panels':what)+' to defaults?'))return;
     await api('/api/dashboard',{op:'reset',what:what||'all'});loadDashCfg(true);toast('Dashboard reset');}
 
+  // ── Live action monitor: every action the agents take, streamed ──
+  // Cursor-based, so reconnecting or switching views never replays old rows.
+  let watchOn=(localStorage.aiosWatch==='1'), watchTimer=null, actCursor=0, ACTIONS=[];
+  const AUD_ICON={shell:'⚡','shell.blocked':'⛔','shell.denied':'⛔','shell.timeout':'⏱',
+    'shell.error':'⚠️',denied:'🔒','dashboard.set':'🎨','dashboard.panel':'🧩','dashboard.nav':'🎨',
+    'dashboard.reset':'↩️','channel.configure':'📡','skill.install':'🎓','skill.learn':'🎓',
+    'update.apply':'⬆️','update.rollback':'↩️','canvas.pin':'📌',run:'🐝'};
+  function audIcon(a){ if(AUD_ICON[a])return AUD_ICON[a]; if(a.startsWith('web.'))return '🌐';
+    if(a.startsWith('dashboard'))return '🎨'; if(a.startsWith('shell'))return '⚡'; return '•'; }
+  function setWatchUI(){
+    const label=watchOn?'👁 Actions: live':'👁 Actions: off';
+    const b=document.getElementById('watchBtn'); if(b){b.textContent=label;b.classList.toggle('primary',watchOn);}
+    const b2=document.getElementById('watchBtn2'); if(b2){b2.textContent=watchOn?'⏸ Stop watching':'👁 Start watching';}
+  }
+  function toggleWatch(){ watchOn=!watchOn; localStorage.aiosWatch=watchOn?'1':'0'; setWatchUI();
+    if(watchOn){ pollActions(); watchTimer=setInterval(pollActions,1500); toast('Watching agent actions live'); }
+    else { clearInterval(watchTimer); watchTimer=null; toast('Stopped watching'); } }
+  function clearActions(){ ACTIONS=[]; renderActions(); }
+  async function pollActions(){
+    try{
+      const r=await(await fetch('/api/actions?since='+actCursor)).json();
+      actCursor=r.cursor||actCursor;
+      if((r.actions||[]).length){ ACTIONS=ACTIONS.concat(r.actions).slice(-500); }
+      renderRunning(r.running||[]);
+      const st=document.getElementById('watchStat');
+      if(st)st.textContent=`${ACTIONS.length} action(s) · ${(r.running||[]).length} running · full control ${r.full_control?'ON':'off'} · guardrails ${r.guardrails?'on':'OFF'}`;
+      if((r.actions||[]).length)renderActions();
+    }catch(e){}
+  }
+  function renderRunning(run){
+    const el=document.getElementById('runningNow'); if(!el)return;
+    if(!run.length){el.innerHTML='';return;}
+    el.innerHTML=run.map(x=>`<div class="card" style="padding:11px 14px;border-color:var(--accent);display:flex;gap:10px;align-items:center">
+      <span class="spin"></span><b>${esc(x.actor)}</b><span class="pill">${esc(x.kind)}</span>
+      <span class="mono" style="color:var(--text2);flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(x.detail)}</span>
+      <span class="pill">${x.elapsed}s</span></div>`).join('');
+  }
+  function renderActions(){
+    const el=document.getElementById('actionFeed'); if(!el)return;
+    const onlyShell=(document.getElementById('watchOnlyShell')||{}).checked;
+    const rows=ACTIONS.filter(a=>!onlyShell||(a.action||'').startsWith('shell'));
+    if(!rows.length){el.innerHTML='<div class="actrow" style="color:var(--text3)">'+(watchOn?'Watching… nothing yet.':'Not watching. Hit “Start watching”.')+'</div>';return;}
+    el.innerHTML=rows.slice(-300).map(a=>{
+      const t=new Date((a.ts||0)*1000).toLocaleTimeString();
+      const bad=!a.ok;
+      return `<div class="actrow ${bad?'bad':''}">
+        <span class="at">${t}</span>
+        <span class="ai">${audIcon(a.action||'')}</span>
+        <span class="aa">${esc(a.actor||'')}</span>
+        <span class="ak">${esc(a.action||'')}</span>
+        <span class="ad mono">${esc((a.detail||'').split('\n').join(' ⏎ ').slice(0,300))}</span>
+      </div>`;}).join('');
+    if((document.getElementById('watchAutoscroll')||{}).checked)el.scrollTop=el.scrollHeight;
+  }
+
   // ── Supervised updates ──
   const VCOL={SAFE:'up',RISKY:'',BLOCK:'down'};
   async function loadUpdates(){try{const r=await(await fetch('/api/updates')).json();renderUpdates(r);}catch(e){document.getElementById('updList').innerHTML='<p style="color:var(--text3)">Updates unavailable.</p>';}}
@@ -1190,7 +1329,7 @@
     }catch(e){}
   }
   refresh();setInterval(refresh,5000);
-  renderConvs();renderMsgs();loadPrompts();refreshUsage();loadModes();loadDashCfg(true);setInterval(loadDashCfg,4000);
+  renderConvs();renderMsgs();loadPrompts();refreshUsage();loadModes();loadDashCfg(true);setWatchUI();if(watchOn){pollActions();watchTimer=setInterval(pollActions,1500);}setInterval(loadDashCfg,4000);
   if(innerWidth<=760)document.getElementById('menuBtn').style.display='grid';
 </script>
 </body>

@@ -21,6 +21,7 @@ import os
 import platform
 import shutil
 import subprocess
+import threading
 import time
 from pathlib import Path
 
@@ -49,6 +50,35 @@ def exec_timeout() -> int:
 # --------------------------------------------------------------------------- #
 # Shell — the capability that makes "full control" mean something              #
 # --------------------------------------------------------------------------- #
+# What's executing right now. The audit log only records finished actions, so a
+# long-running command would be invisible in the live monitor until it ended —
+# which is exactly when you most want to see it.
+_INFLIGHT: dict[int, dict] = {}
+_INFLIGHT_LOCK = threading.Lock()
+_INFLIGHT_SEQ = [0]
+
+
+def inflight() -> list[dict]:
+    now = time.time()
+    with _INFLIGHT_LOCK:
+        return [{**v, "elapsed": round(now - v["started"], 1)}
+                for v in sorted(_INFLIGHT.values(), key=lambda x: x["started"])]
+
+
+def _inflight_add(actor: str, kind: str, detail: str) -> int:
+    with _INFLIGHT_LOCK:
+        _INFLIGHT_SEQ[0] += 1
+        i = _INFLIGHT_SEQ[0]
+        _INFLIGHT[i] = {"id": i, "actor": actor, "kind": kind,
+                        "detail": str(detail)[:400], "started": time.time()}
+        return i
+
+
+def _inflight_done(i: int):
+    with _INFLIGHT_LOCK:
+        _INFLIGHT.pop(i, None)
+
+
 def shell(cmd: str, actor: str = "brain", cwd: str | None = None,
           timeout: int | None = None) -> dict:
     """Run a command as the user who installed AIOS. Audited, guardrailed, bounded."""
@@ -70,6 +100,7 @@ def shell(cmd: str, actor: str = "brain", cwd: str | None = None,
     shell_cmd = (["powershell", "-NoProfile", "-NonInteractive", "-Command", cmd] if IS_WIN
                  else ["/bin/bash", "-lc", cmd])
     started = time.time()
+    tracker = _inflight_add(actor, "shell", cmd)   # visible while it runs
     try:
         p = subprocess.run(shell_cmd, cwd=cwd or str(ROOT), capture_output=True, text=True,
                            timeout=timeout or exec_timeout(), errors="replace")
@@ -81,6 +112,8 @@ def shell(cmd: str, actor: str = "brain", cwd: str | None = None,
     except Exception as e:
         brain.audit(actor, "shell.error", f"{cmd} :: {e}", ok=False)
         return {"ok": False, "code": -1, "out": "", "err": str(e), "blocked": False}
+    finally:
+        _inflight_done(tracker)
 
     brain.audit(actor, "shell", f"$ {cmd}\n(exit {code}, {time.time()-started:.1f}s)", ok=code == 0)
     return {"ok": code == 0, "code": code, "out": out[-8000:], "err": err[-4000:], "blocked": False}
