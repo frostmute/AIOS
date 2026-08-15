@@ -895,21 +895,78 @@ def _wizard_env(args):
         say(f"  Add it any time: {C.B}aios setup --force{C.R}, edit {C.B}.env{C.R}, "
             f"or use the hub's {C.B}Settings{C.R} panel.")
     elif interactive:
-        prov = input(f"  Provider [openrouter/anthropic/openai/gemini] ({data['AIOS_LLM_PROVIDER']}): ").strip().lower()
-        if prov in ("skip", "none"):
+        say(f"\n  {C.B}How should the agents talk to a model?{C.R}")
+        say(f"    {C.CYN}1{C.R}  Claude Pro/Max subscription  {C.GRY}— no API key, no per-token cost{C.R}")
+        say(f"    {C.CYN}2{C.R}  OpenRouter                   {C.GRY}— one key, most models{C.R}")
+        say(f"    {C.CYN}3{C.R}  Anthropic API key")
+        say(f"    {C.CYN}4{C.R}  OpenAI API key")
+        say(f"    {C.CYN}5{C.R}  Google Gemini API key")
+        say(f"    {C.GRY}s{C.R}  skip for now")
+        choice = input(f"  Choice [1-5/s] ({data['AIOS_LLM_PROVIDER']}): ").strip().lower()
+
+        by_num = {"1": "claude", "2": "openrouter", "3": "anthropic",
+                  "4": "openai", "5": "gemini", "s": "skip"}
+        prov = by_num.get(choice, choice or data["AIOS_LLM_PROVIDER"])
+
+        if prov in ("skip", "none", "s"):
             skip = True
+        elif prov in ("claude", "claudecode", "claude-code", "subscription"):
+            # Route everything through claude-code-api, which authenticates with
+            # the Claude CLI login rather than an API key.
+            ccp = cfg_get(load_config(), "services.claudecode.port", 8000)
+            data["AIOS_LLM_PROVIDER"] = "claudecode"
+            data["AIOS_LLM_BASE_URL"] = f"http://127.0.0.1:{ccp}/v1"
+            data["AIOS_LLM_API_KEY"] = "sk-aios-claudecode"   # placeholder; auth is the CLI
+            data["AIOS_DEFAULT_MODEL"] = (
+                input(f"  Claude model (claude-sonnet-4-5): ").strip() or "claude-sonnet-4-5")
+            ok("using your Claude subscription via claude-code")
+            claude = find_tool("claude")
+            if not claude:
+                warn("the `claude` CLI isn't installed yet — install it with:")
+                say(f"    {C.B}npm install -g @anthropic-ai/claude-code{C.R}")
+                say(f"    {C.GRY}then run `aios claude-login` to authorise your account.{C.R}")
+            elif _claude_logged_in(claude):
+                ok("the Claude CLI is already logged in")
+            else:
+                say(f"  {C.GRY}Your Claude CLI isn't logged in yet.{C.R}")
+                if input("  Log in now? [Y/n]: ").strip().lower() not in ("n", "no"):
+                    try:
+                        subprocess.run([claude, "setup-token"])
+                    except KeyboardInterrupt:
+                        pass
+                    except Exception as e:
+                        warn(f"could not launch the login: {e}")
+                else:
+                    say(f"  {C.GRY}Run `aios claude-login` when you're ready.{C.R}")
         else:
-            data["AIOS_LLM_PROVIDER"] = prov or data["AIOS_LLM_PROVIDER"]
+            data["AIOS_LLM_PROVIDER"] = prov
+            data.pop("AIOS_LLM_BASE_URL", None)  # don't leave a stale claude-code URL
             key = input(f"  API key ({mask(data.get('AIOS_LLM_API_KEY', ''))}): ").strip()
             if key:
                 data["AIOS_LLM_API_KEY"] = key
             model = input(f"  Default model ({data['AIOS_DEFAULT_MODEL']}): ").strip()
             data["AIOS_DEFAULT_MODEL"] = model or data["AIOS_DEFAULT_MODEL"]
-            say(f"  {C.GRY}Optional channel tokens (Enter to skip each):{C.R}")
-            for ck in CHANNEL_KEYS:
-                val = input(f"    {ck} ({mask(data.get(ck, ''))}): ").strip()
-                if val:
-                    data[ck] = val
+
+        if not skip:
+            # Messaging is a whole agent (openclaw) + 28 channels. Plenty of people
+            # want the coding/research side and no chat bridge at all, and running
+            # it costs a gateway process and a build.
+            say(f"\n  {C.B}Messaging channels?{C.R} {C.GRY}(WhatsApp, Telegram, Discord, "
+                f"Slack, Signal…){C.R}")
+            say(f"  {C.GRY}This runs the openclaw gateway. Skip it if you only want the "
+                f"coding/research agents.{C.R}")
+            want = input("  Set up messaging? [y/N]: ").strip().lower()
+            if want in ("y", "yes"):
+                say(f"  {C.GRY}Enter any tokens you have (Enter to skip each):{C.R}")
+                for ck in CHANNEL_KEYS:
+                    val = input(f"    {ck} ({mask(data.get(ck, ''))}): ").strip()
+                    if val:
+                        data[ck] = val
+                say(f"  {C.GRY}More channels later: `aios channels` or the hub → Channels.{C.R}")
+            else:
+                disable_messaging()
+                ok("messaging skipped — openclaw won't start "
+                   "(re-enable in aios.config.yaml or with `aios channels --enable`)")
     else:  # non-interactive: env-driven
         for var in ("AIOS_LLM_PROVIDER", "AIOS_LLM_API_KEY", "AIOS_DEFAULT_MODEL"):
             if os.environ.get(var):
@@ -1953,6 +2010,75 @@ def cmd_web(args):
         print(json.dumps(r, indent=2)[:12000])
 
 
+def _claude_logged_in(claude: str) -> bool:
+    """Cheap check that doesn't cost a completion: the CLI reports auth state."""
+    for probe in (["auth", "status"], ["--version"]):
+        try:
+            r = subprocess.run([claude, *probe], capture_output=True, text=True, timeout=25)
+            out = (r.stdout + r.stderr).lower()
+            if probe[0] == "auth":
+                if r.returncode == 0 and ("logged in" in out or "authenticated" in out):
+                    return True
+                if "not logged in" in out or "unauthenticated" in out:
+                    return False
+        except Exception:
+            continue
+    return False
+
+
+def _set_service_enabled(name: str, enabled: bool) -> bool:
+    """Flip `services.<name>.enabled` in aios.config.yaml, preserving comments.
+
+    The bundled YAML reader only handles simple `key: value` maps, so this edits
+    the text rather than round-tripping through a parser that would strip every
+    explanatory comment in the file."""
+    path = ROOT / "aios.config.yaml"
+    if not path.exists():
+        return False
+    # newline="" keeps the file's own line endings visible instead of translating
+    # them; writing back with the default would flip the whole file LF<->CRLF and
+    # produce a diff touching every line.
+    raw = path.read_text(encoding="utf-8", newline="")
+    nl = "\r\n" if "\r\n" in raw else "\n"
+    lines = raw.replace("\r\n", "\n").split("\n")
+    trailing = lines.pop() if lines and lines[-1] == "" else None
+    in_services = False
+    in_target = False
+    changed = False
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        if not line.startswith(" ") and stripped.startswith("services:"):
+            in_services = True
+            continue
+        if in_services and line and not line.startswith(" "):
+            break  # left the services block
+        if in_services and line.startswith("  ") and not line.startswith("    "):
+            in_target = stripped.split(":")[0].strip() == name
+            continue
+        if in_target and stripped.startswith("enabled:"):
+            indent = line[:len(line) - len(line.lstrip())]
+            comment = line.split("#", 1)[1] if "#" in line else ""
+            lines[i] = f"{indent}enabled: {'true' if enabled else 'false'}" + \
+                       (f"  #{comment}" if comment else "")
+            changed = True
+            in_target = False
+    if changed:
+        out = nl.join(lines) + (nl if trailing is not None else "")
+        path.write_text(out, encoding="utf-8", newline="")
+    return changed
+
+
+def disable_messaging():
+    """Turn off the messaging gateway and everything that only exists to serve it."""
+    for svc in ("openclaw", "openclaw_proxy", "openclaw_os"):
+        _set_service_enabled(svc, False)
+
+
+def enable_messaging():
+    for svc in ("openclaw", "openclaw_proxy", "openclaw_os"):
+        _set_service_enabled(svc, True)
+
+
 def _vault():
     sys.path.insert(0, str(ROOT))
     import aios_vault
@@ -2231,6 +2357,14 @@ def cmd_exec(args):
 
 def cmd_channels(args):
     """List every messaging channel the gateway can bridge, and which are configured."""
+    if getattr(args, "enable", False):
+        enable_messaging()
+        ok("messaging enabled — start it with `aios start openclaw`")
+        return
+    if getattr(args, "disable", False):
+        disable_messaging()
+        ok("messaging disabled — `aios stop openclaw` to stop it now")
+        return
     sys.path.insert(0, str(ROOT))
     import aios_tools
     chans = aios_tools.channels()
@@ -2546,8 +2680,10 @@ def build_parser():
     s.add_argument("command", nargs=argparse.REMAINDER)
     s.set_defaults(func=cmd_exec)
 
-    sub.add_parser("channels", help="list the 28 messaging channels and which are configured"
-                   ).set_defaults(func=cmd_channels)
+    s = sub.add_parser("channels", help="list the 28 messaging channels and which are configured")
+    s.add_argument("--enable", action="store_true", help="turn the messaging gateway back on")
+    s.add_argument("--disable", action="store_true", help="turn messaging off (skips openclaw)")
+    s.set_defaults(func=cmd_channels)
 
     s = sub.add_parser("attach", help="jump into a running OpenClaw gateway session mid-run")
     s.add_argument("args", nargs=argparse.REMAINDER)
