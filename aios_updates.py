@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import io
 import json
+import re
 import os
 import shutil
 import subprocess
@@ -243,6 +244,9 @@ def build_review_prompt(u: dict) -> str:
     return "\n".join(lines)
 
 
+_ANSI = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")   # CSI escape sequences
+
+
 def parse_verdict(text: str) -> dict:
     v, why, watch = "RISKY", "", ""
     for line in (text or "").splitlines():
@@ -266,14 +270,25 @@ def review(u: dict, ask) -> dict:
     if not u.get("behind"):
         return {"verdict": "SAFE", "why": "no upstream changes", "watch": ""}
     prompt = build_review_prompt(u)
-    try:
-        text = ask("opencode", prompt, REVIEW_SYS)
-        if not text or text.strip().startswith("⚠️"):
-            text = ask("brain", prompt, REVIEW_SYS)
-    except Exception as e:
-        return {"verdict": "RISKY", "why": f"agent review failed: {e}", "watch": ""}
+    text, errors = "", []
+    # A reviewer that errors (provider refused, CLI crashed) returns prose, not a
+    # verdict. Treat "no VERDICT line" as a failed review and ask the next agent,
+    # rather than reading an error message as an opinion about the code.
+    for agent in ("opencode", "brain"):
+        try:
+            text = _ANSI.sub("", ask(agent, prompt, REVIEW_SYS) or "")
+        except Exception as e:
+            errors.append(f"{agent}: {e}")
+            continue
+        if re.search(r"^\s*VERDICT:", text, re.I | re.M):
+            break
+        errors.append(f"{agent}: {text.strip().splitlines()[0][:160] if text.strip() else 'empty reply'}")
+        text = ""
+    if not text:
+        return {"verdict": "RISKY", "why": "no reviewer produced a verdict — " + "; ".join(errors),
+                "watch": "", "reviewed": False}
     out = parse_verdict(text)
-    out["raw"] = (text or "")[:2000]
+    out["raw"] = text[:2000]
     return out
 
 

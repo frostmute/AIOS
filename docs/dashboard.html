@@ -211,7 +211,7 @@
   .patrow small{color:var(--text3);font-size:.72rem;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
   #modeBtns .btn.primary{background:var(--accent);color:var(--bg);border-color:var(--accent)}
   /* Company (Paperclip) */
-  .co-grid{display:grid;grid-template-columns:minmax(260px,340px) 1fr;gap:14px;margin-top:14px;align-items:start}
+  .co-grid{display:grid;grid-template-columns:minmax(300px,390px) 1fr;gap:14px;margin-top:14px;align-items:start}
   @media(max-width:900px){.co-grid{grid-template-columns:1fr}}
   .co-stats{display:flex;flex-wrap:wrap;gap:8px}
   .co-stat{background:var(--surface);border:1px solid var(--border);border-radius:10px;padding:8px 14px;display:flex;flex-direction:column;min-width:84px}
@@ -232,6 +232,9 @@
   .co-empty{color:var(--text3);font-size:12px;margin:4px 2px}
   .co-cm{border-left:3px solid var(--accent);padding:4px 10px;font-size:13px}
   .co-cm small{color:var(--text3)}
+  #company input,#company textarea{width:100%;box-sizing:border-box}
+  .co-form{display:flex;gap:8px;margin-top:8px;align-items:stretch}
+  .co-form select{flex:1 1 0;min-width:0;width:auto;padding-left:10px;padding-right:6px}.co-form #coPriority{flex:0 0 96px}.co-form .btn{white-space:nowrap}
 </style>
 </head>
 <body>
@@ -427,7 +430,7 @@
             <div class="card" style="margin-top:14px"><h3>New ticket</h3>
               <input id="coTitle" placeholder="What needs doing?">
               <textarea id="coDesc" style="margin-top:8px;min-height:80px" placeholder="Details, acceptance criteria, links… (optional)"></textarea>
-              <div class="inrow" style="margin-top:8px">
+              <div class="co-form">
                 <select id="coAssignee"></select>
                 <select id="coPriority"><option>low</option><option selected>medium</option><option>high</option><option>urgent</option></select>
                 <button class="btn primary" onclick="coFile()">File &amp; wake</button>
@@ -724,8 +727,8 @@
     const same=(typeof u==='string')&&(u.startsWith('/')||u.startsWith(location.origin));
     if(AIOS_TOKEN&&same){o.headers=Object.assign({'Authorization':'Bearer '+AIOS_TOKEN},o.headers||{});}
     return _f(u,o);};})();
-  const ROLES={opencode:"coding engine",hermes:"autonomous agent",openclaw:"channel gateway",crewai:"multi-agent crews",claudecode:"Claude Code API",codex:"Codex (ChatGPT sub)","openclaw-os":"dashboard",hub:"brain + interconnect"};
-  const ICON={opencode:"⌨️",hermes:"☤",openclaw:"🦞",crewai:"👥",claudecode:"◈",codex:"⌁","openclaw-os":"🪟",hub:"◆",brain:"◆",team:"✦",all:"🌐"};
+  const ROLES={opencode:"coding engine",hermes:"autonomous agent",openclaw:"channel gateway",crewai:"multi-agent crews",claudecode:"Claude Code API",codex:"Codex (ChatGPT sub)",paperclip:"company layer","openclaw-os":"dashboard",hub:"brain + interconnect"};
+  const ICON={opencode:"⌨️",hermes:"☤",openclaw:"🦞",crewai:"👥",claudecode:"◈",codex:"⌁",paperclip:"🏢","openclaw-os":"🪟",hub:"◆",brain:"◆",team:"✦",all:"🌐"};
   let target="brain", peers={}, svc={}, history=[];
 
   // ── themes (applied as CSS vars from JS → enables the theme store) ──
@@ -800,6 +803,7 @@
     document.querySelectorAll('.view').forEach(x=>x.classList.toggle('active',x.id===v));
     document.querySelectorAll('.nav').forEach(b=>b.classList.toggle('active',b.dataset.v===v));
     document.querySelector('aside').classList.remove('open');
+    try{history.replaceState(null,'',v==='chat'?location.pathname+location.search:'#'+v);}catch(e){}
     if(v==='hermes')frame('hermesFrame','hermesNew',peers['hermes-embed']||peers.hermes);
     if(v==='openclawos')frame('osFrame','osNew',peers['openclaw-os']);
     if(v==='openclaw')frame('clawFrame','clawNew',peers['openclaw-embed']||peers.openclaw);
@@ -1059,7 +1063,7 @@
     document.getElementById('coOrg').innerHTML=ceo?`${card(ceo)}<div class="co-reports">${ags.filter(a=>a.reportsTo).map(card).join('')}</div>`:'';
     const sel=document.getElementById('coAssignee'), keep=sel.value;
     sel.innerHTML=ags.filter(a=>a.slug).map(a=>`<option value="${esc(a.slug)}">${esc(a.name)}${a.slug==='brain'?' (CEO)':''}</option>`).join('');
-    if(keep)sel.value=keep;
+    sel.value=keep||'brain';
     const iss=(r.issues||[]).filter(i=>i.status!=='cancelled');
     document.getElementById('coCols').innerHTML=CO_COLS.map(([k,l])=>{const xs=iss.filter(i=>i.status===k);
       return `<div class="co-col"><div class="co-colh">${l}<span>${xs.length}</span></div>${xs.slice(0,25).map(i=>`<button class="co-tk ${coOpen===i.id?'on':''}" data-id="${esc(i.id)}" onclick="coShow(this.dataset.id)"><span class="mono">${esc(i.key||'')}</span> ${esc(i.title||'')}<small>${esc(i.assignee||'unassigned')} · ${esc(i.priority||'')}</small></button>`).join('')||'<p class="co-empty">—</p>'}</div>`;}).join('');
@@ -1343,7 +1347,7 @@
   async function delWidget(id){await api('/api/ui',{op:'delete',id});loadCanvas();}
   async function clearCanvas(){await api('/api/ui',{op:'clear'});loadCanvas();}
   // command palette
-  const PAL=[{t:'💬 Chat',f:()=>nav('chat')},{t:'📊 Status',f:()=>nav('status')},{t:'🧠 Memory & prompts',f:()=>nav('memory')},{t:'⏰ Automations',f:()=>nav('automations')},{t:'⚙️ Settings',f:()=>nav('settings')},{t:'＋ New conversation',f:()=>newConv()},{t:'⬇️ Export chat',f:()=>exportConv()},{t:'↻ Restart all agents',f:()=>act('restart')},{t:'🦞 Open openclaw',f:()=>nav('openclaw')},{t:'☤ Open hermes',f:()=>nav('hermes')},{t:'🪟 Open openclaw-os',f:()=>nav('openclawos')}];
+  const PAL=[{t:'💬 Chat',f:()=>nav('chat')},{t:'📊 Status',f:()=>nav('status')},{t:'🧠 Memory & prompts',f:()=>nav('memory')},{t:'⏰ Automations',f:()=>nav('automations')},{t:'⚙️ Settings',f:()=>nav('settings')},{t:'＋ New conversation',f:()=>newConv()},{t:'⬇️ Export chat',f:()=>exportConv()},{t:'↻ Restart all agents',f:()=>act('restart')},{t:'🦞 Open openclaw',f:()=>nav('openclaw')},{t:'☤ Open hermes',f:()=>nav('hermes')},{t:'🪟 Open openclaw-os',f:()=>nav('openclawos')},{t:'🏢 Company (Paperclip)',f:()=>nav('company')},{t:'🐝 Swarm',f:()=>nav('swarm')}];
   let palSel=0;
   function openPalette(){document.getElementById('palette').classList.add('on');const i=document.getElementById('palInput');i.value='';palSel=0;renderPalette();setTimeout(()=>i.focus(),40);}
   function closePalette(){document.getElementById('palette').classList.remove('on');}
@@ -1465,18 +1469,18 @@
   async function refresh(){
     try{const s=await(await fetch('/api/services')).json();svc=s;peers=Object.fromEntries(Object.entries(s).map(([k,v])=>[k,v.url]));
       document.querySelectorAll('.nav[data-svc]').forEach(n=>{const k=n.dataset.svc;n.classList.toggle('up',!!(s[k]&&s[k].up));n.classList.toggle('down',!(s[k]&&s[k].up));});
-      const order=["hub","opencode","hermes","openclaw","crewai","openclaw-os"];
+      const order=["hub","opencode","hermes","openclaw","crewai","claudecode","codex","paperclip","openclaw-os"];
       document.getElementById('statgrid').innerHTML=order.filter(k=>s[k]).map(k=>`
         <div class="card" style="margin:0"><h3>${ICON[k]||''} ${k} <span class="badge ${s[k].up?'up':'down'}" style="margin-left:auto">${s[k].up?'UP':'DOWN'}</span></h3>
         <p style="font-size:.82rem">${ROLES[k]||''}</p><div class="kv" style="margin-top:10px">${s[k].url}</div>
         <div class="row">${k!=='hub'&&k!=='openclaw-os'?`<button class="btn sm" onclick="act('restart','${k}')">↻</button><button class="btn sm danger" onclick="act('stop','${k}')">■</button>`:''}</div></div>`).join('');
       // right workspace panel (chat view)
-      const nvmap={'openclaw-os':'openclawos'};
+      const nvmap={'openclaw-os':'openclawos',paperclip:'company'};
       document.getElementById('wsPanel').innerHTML=order.filter(k=>s[k]&&k!=='hub').map(k=>`
         <div class="ws-item ${s[k].up?'up':''}" onclick="nav('${nvmap[k]||k}')"><span class="dot"></span><span class="nm">${ICON[k]||''} ${k}</span><span class="rl">${s[k].up?'live':'off'}</span></div>`).join('');
     }catch(e){}
   }
-  refresh();setInterval(refresh,5000);
+  refresh().then(()=>{const h=decodeURIComponent(location.hash.slice(1));const el=h&&document.getElementById(h);if(el&&el.classList.contains('view'))nav(h);});setInterval(refresh,5000);
   renderConvs();renderMsgs();loadPrompts();refreshUsage();loadModes();loadDashCfg(true);setWatchUI();if(watchOn){pollActions();watchTimer=setInterval(pollActions,1500);}setInterval(loadDashCfg,4000);
   if(innerWidth<=760)document.getElementById('menuBtn').style.display='grid';
 </script>
