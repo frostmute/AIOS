@@ -1,0 +1,111 @@
+/* Tailwind 4 reads its configuration from CSS. The settings in this file come
+ * from the tailwind.config.ts file that it replaces.
+ *
+ * Every @import must come before the other rules. Tailwind needs to read its
+ * own theme before it reads the Skeleton CSS, because Skeleton uses the
+ * Tailwind breakpoint variants. */
+@import 'tailwindcss';
+
+/* Skeleton 5 supplies CSS only. The Svelte components are in a separate
+ * package. */
+@import '@skeletonlabs/skeleton';
+
+/* Each theme that theme-store.ts can select needs an import. The v2 names
+ * "skeleton" and "gold-nouveau" are now "legacy" and "nouveau". */
+@import '@skeletonlabs/skeleton/themes/legacy';
+@import '@skeletonlabs/skeleton/themes/modern';
+@import '@skeletonlabs/skeleton/themes/crimson';
+@import '@skeletonlabs/skeleton/themes/nouveau';
+@import '@skeletonlabs/skeleton/themes/hamlindigo';
+@import '@skeletonlabs/skeleton/themes/vintage';
+@import '@skeletonlabs/skeleton/themes/seafoam';
+@import '@skeletonlabs/skeleton/themes/sahara';
+@import '@skeletonlabs/skeleton/themes/rocket';
+@import './themes/my-custom-theme.css';
+
+@plugin '@tailwindcss/forms';
+@plugin '@tailwindcss/typography';
+
+/* Tailwind must scan the Skeleton component package to keep the classes that
+ * those components use. */
+@source '../node_modules/@skeletonlabs/skeleton-svelte/dist';
+
+/* The v3 config set darkMode to "class". Tailwind 4 needs this variant to read
+ * the "dark" class that app.html puts on the html element. */
+@custom-variant dark (&:where(.dark, .dark *));
+
+@theme {
+  --font-mono: 'Fira Code', monospace;
+
+  /* These colors read CSS variables that no file defines, because the block
+   * that declared them in app.css is commented out. Tailwind 3 behaved the
+   * same way, so the declarations stay as they are to hold the appearance
+   * steady. Define the variables in this file to make the colors work. */
+  --color-border: hsl(var(--border));
+  --color-input: hsl(var(--input));
+  --color-ring: hsl(var(--ring));
+  --color-background: hsl(var(--background));
+  --color-foreground: hsl(var(--foreground));
+  --color-primary: hsl(var(--primary));
+  --color-primary-foreground: hsl(var(--primary-foreground));
+  --color-secondary: hsl(var(--secondary));
+  --color-secondary-foreground: hsl(var(--secondary-foreground));
+  --color-destructive: hsl(var(--destructive));
+  --color-destructive-foreground: hsl(var(--destructive-foreground));
+  --color-muted: hsl(var(--muted));
+  --color-muted-foreground: hsl(var(--muted-foreground));
+  --color-accent: hsl(var(--accent));
+  --color-accent-foreground: hsl(var(--accent-foreground));
+  --color-popover: hsl(var(--popover));
+  --color-popover-foreground: hsl(var(--popover-foreground));
+  --color-card: hsl(var(--card));
+  --color-card-foreground: hsl(var(--card-foreground));
+
+  --animate-blink: blink 1s step-end infinite;
+}
+
+@keyframes blink {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0;
+  }
+}
+
+/* Tailwind 4 no longer takes container settings from a configuration file. */
+@utility container {
+  margin-inline: auto;
+  padding-inline: 2rem;
+  max-width: 1400px;
+}
+
+html,
+body {
+  @apply h-full overflow-hidden;
+}
+
+.terminal-output {
+  @apply font-mono text-sm;
+}
+
+.terminal-input {
+  @apply font-mono text-sm;
+}
+
+/* The typography plugin puts quotation marks around inline code. Remove them. */
+.prose :where(code):not(:where([class~='not-prose'] *))::before,
+.prose :where(code):not(:where([class~='not-prose'] *))::after {
+  content: '';
+}
+
+/* Theme overrides. The v2 "skeleton" theme is now "legacy". */
+:root [data-theme='legacy'] {
+  --typo-base--font-family:
+    system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell,
+    'Open Sans', 'Helvetica Neue', sans-serif;
+  --typo-heading--font-family:
+    system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell,
+    'Open Sans', 'Helvetica Neue', sans-serif;
+}
