@@ -48,7 +48,7 @@ FROM base AS runtime
 WORKDIR /aios
 
 LABEL org.opencontainers.image.title="The AI OS" \
-      org.opencontainers.image.description="Nine open-source AI projects. One operating system." \
+      org.opencontainers.image.description="Eleven open-source AI projects. One operating system." \
       org.opencontainers.image.source="https://github.com/ZDStudios/AIOS" \
       org.opencontainers.image.licenses="MIT"
 
@@ -85,8 +85,8 @@ ENV AIOS_ROOT=/aios \
     AIOS_NO_UPDATE_CHECK=1
 
 #   8787 hub · 4096 opencode · 9119 hermes · 18789 openclaw
-#   4788 crewai · 8000 claude-code · 8791/8792 embed proxies
-EXPOSE 8787 4096 9119 18789 4788 8000 8791 8792
+#   4788 crewai · 8000 claude-code · 8010 codex · 3100 paperclip · 8791/8792 embed proxies
+EXPOSE 8787 4096 9119 18789 4788 8000 8010 3100 8791 8792
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=180s --retries=5 \
     CMD curl -fsS http://127.0.0.1:8787/health || exit 1

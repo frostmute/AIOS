@@ -27,6 +27,8 @@ services:
       # - "18789:18789"    # openclaw gateway (+ openclaw-os dashboard)
       # - "4788:4788"      # CrewAI API
       # - "8000:8000"      # claude-code API (OpenAI-compatible)
+      # - "8010:8010"      # Codex API (OpenAI-compatible)
+      # Paperclip (:3100) binds loopback in local_trusted mode; use the hub's Company view
       # - "8791:8791"      # openclaw embed proxy
       # - "8792:8792"      # hermes embed proxy
     environment:
