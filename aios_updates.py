@@ -53,6 +53,10 @@ SOURCES = {
     "caveman":    {"repo": "JuliusBrussee/caveman",     "dir": "caveman-main",         "tier": "content"},
     "ponytail":   {"repo": "DietrichGebert/ponytail",   "dir": "ponytail-main",        "tier": "content"},
     "ruflo":      {"repo": "ruvnet/ruflo",              "dir": "ruflo-main",           "tier": "content"},
+    # `only`: vendor just these top-level entries (the server itself comes from npm).
+    "paperclip":  {"repo": "paperclipai/paperclip",     "dir": "paperclip-main",       "tier": "content",
+                   "only": ["README.md", "LICENSE", "AGENTS.md", "SECURITY.md", "adapter-plugin.md",
+                            "docs", "skills", "VENDORED.md"]},
 }
 
 # What each project is used for — given to the agent so its risk call is grounded
@@ -69,6 +73,11 @@ INTEGRATION_NOTES = {
     "ponytail": "AIOS reads skills/ponytail/SKILL.md as a system-prompt overlay and mounts its skills.",
     "ruflo": ("AIOS mounts its SKILL.md and lists plugins/*/skills. The runtime comes from "
               "npm (`npx ruflo@latest`), so upstream code changes here are docs/skills only."),
+    "paperclip": ("The company layer on :3100 (org chart, tickets, heartbeats). The server is the "
+                  "npm `paperclipai` package on a private Node 24; AIOS drives it over its REST API "
+                  "(companies, agents, issues, heartbeat/invoke, agent keys) and receives HTTP-adapter "
+                  "webhooks at /api/paperclip/heartbeat. The vendored copy is docs + skills only. "
+                  "Flag changes to the issue status machine, the HTTP adapter payload, or agent auth."),
 }
 
 
@@ -344,6 +353,17 @@ def apply(name: str, sha: str | None = None, health_url: str = "",
     if not extracted:
         shutil.rmtree(staging, ignore_errors=True)
         return {"ok": False, "error": "download/extract failed (or unsafe tar member)"}
+
+    only = src.get("only")
+    if only:
+        # Trimmed vendor copy: drop everything upstream ships that we don't keep,
+        # and carry our own files (e.g. VENDORED.md) across from the current copy.
+        for entry in list(extracted.iterdir()):
+            if entry.name not in only:
+                shutil.rmtree(entry, ignore_errors=True) if entry.is_dir() else entry.unlink()
+        for name_ in only:
+            if not (extracted / name_).exists() and (target / name_).is_file():
+                shutil.copy2(target / name_, extracted / name_)
 
     # Preserve installed deps so a reinstall is incremental rather than from scratch.
     log(f"[{name}] backing up → {backup}")

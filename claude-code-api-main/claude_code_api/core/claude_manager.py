@@ -51,11 +51,21 @@ class ClaudeProcess:
         self.last_error = None
         try:
             # Prepare real command - using exact format from working Claudia example
-            cmd = [settings.claude_binary_path]
-            cmd.extend(["-p", prompt])
-
+            # The prompt goes in on STDIN and the system prompt via a FILE, never
+            # as argv. On Windows `claude` resolves to claude.CMD, and cmd.exe
+            # truncates an argv item at its first newline — so every multi-line
+            # prompt arrived cut short and Claude answered "I'm ready — what would
+            # you like me to do?" instead of the question. (AIOS patch.)
+            cmd = [settings.claude_binary_path, "-p"]
+            self._system_prompt_file = None
             if system_prompt:
-                cmd.extend(["--system-prompt", system_prompt])
+                import tempfile
+                spf = tempfile.NamedTemporaryFile(
+                    "w", suffix=".txt", prefix="ccapi-sys-", delete=False, encoding="utf-8")
+                spf.write(system_prompt)
+                spf.close()
+                self._system_prompt_file = spf.name
+                cmd.extend(["--system-prompt-file", spf.name])
 
             if model:
                 cmd.extend(["--model", model])
@@ -102,6 +112,11 @@ class ClaudeProcess:
                 stderr=asyncio.subprocess.PIPE,
                 stdin=asyncio.subprocess.PIPE,
             )
+            # -p with no prompt argument reads the prompt from stdin until EOF.
+            if self.process.stdin:
+                self.process.stdin.write(prompt.encode("utf-8"))
+                await self.process.stdin.drain()
+                self.process.stdin.close()
 
             self.is_running = True
 
@@ -263,6 +278,13 @@ class ClaudeProcess:
     async def stop(self):
         """Stop Claude process."""
         self.is_running = False
+        spf = getattr(self, "_system_prompt_file", None)
+        if spf:
+            try:
+                os.unlink(spf)
+            except OSError:
+                pass
+            self._system_prompt_file = None
 
         for task in (self._output_task, self._error_task):
             if task and not task.done():

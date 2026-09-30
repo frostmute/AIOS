@@ -38,6 +38,7 @@ import aios_web as web          # noqa: E402  YouTube / Reddit / HN / page reade
 import aios_swarm as swarm      # noqa: E402  decompose big tasks across agents
 import aios_plugins as plugins  # noqa: E402  the plugin store
 import aios_vault as vault      # noqa: E402  master password for destructive ops
+import aios_paperclip as paperclip  # noqa: E402  the company layer (paperclipai/paperclip)
 
 PORT = int(os.environ.get("AIOS_HUB_PORT", "8787"))
 ROOT = Path(os.environ.get("AIOS_ROOT", Path(__file__).resolve().parent))
@@ -102,6 +103,7 @@ PEERS = {
     "crewai": os.environ.get("AIOS_CREWAI_URL", "http://127.0.0.1:4788"),
     "claudecode": os.environ.get("AIOS_CLAUDECODE_URL", "http://127.0.0.1:8000"),
     "codex": os.environ.get("AIOS_CODEX_URL", "http://127.0.0.1:8010"),
+    "paperclip": os.environ.get("AIOS_PAPERCLIP_URL", "http://127.0.0.1:3100"),
     "openclaw-os": os.environ.get("AIOS_OPENCLAWOS_URL", "http://127.0.0.1:18789/plugins/openclawos/"),
 }
 CLAUDECODE = os.environ.get("AIOS_CLAUDECODE_URL", "http://127.0.0.1:8000").rstrip("/")
@@ -119,7 +121,7 @@ def read_system_prompt() -> str:
 
 
 # Chat "targets" the AIOS API exposes as OpenAI-style models.
-TARGETS = ["brain", "team", "swarm", "opencode", "crewai", "claudecode", "codex", "fabric", "all"]
+TARGETS = ["brain", "team", "swarm", "company", "opencode", "crewai", "claudecode", "codex", "fabric", "all"]
 
 MEMORY_FILE = ROOT / ".aios" / "memory.json"
 USAGE_FILE = ROOT / ".aios" / "usage.json"
@@ -311,16 +313,31 @@ def llm_base() -> str:
     }.get(prov, "https://openrouter.ai/api/v1")
 
 
+def _up(url: str) -> bool:
+    try:
+        with urllib.request.urlopen(url, timeout=2) as r:
+            return r.status < 500
+    except Exception:
+        return False
+
+
 def llm_chat(messages: list, system: str | None = None) -> str:
     key = os.environ.get("AIOS_LLM_API_KEY") or os.environ.get("OPENROUTER_API_KEY") \
         or os.environ.get("OPENAI_API_KEY") or os.environ.get("ANTHROPIC_API_KEY", "")
-    if not key:
-        return "⚠️ No model API key set. Run `aios setup --force` and enter your key, then restart."
     model = os.environ.get("AIOS_DEFAULT_MODEL", "anthropic/claude-opus-4.6")
+    base = llm_base()
+    if not key:
+        # No API key, but a subscription bridge may be running: fall back to the
+        # Claude CLI login (claude-code-api) rather than leaving the Brain dead.
+        if _up(CLAUDECODE + "/health"):
+            key, base, model = "sk-aios-claudecode", CLAUDECODE + "/v1", \
+                os.environ.get("AIOS_CLAUDECODE_MODEL", "claude-sonnet-4-5")
+        else:
+            return "⚠️ No model API key set. Run `aios setup --force` and enter your key, then restart."
     msgs = ([{"role": "system", "content": system}] if system else []) + messages
     body = json.dumps({"model": model, "messages": msgs}).encode()
     req = urllib.request.Request(
-        llm_base() + "/chat/completions", data=body, method="POST",
+        base + "/chat/completions", data=body, method="POST",
         headers={"Content-Type": "application/json", "Authorization": f"Bearer {key}",
                  "HTTP-Referer": "https://github.com/ZDStudios/AIOS", "X-Title": "The AI OS"})
     try:
@@ -330,7 +347,10 @@ def llm_chat(messages: list, system: str | None = None) -> str:
         with urllib.request.urlopen(req, timeout=int(
                 os.environ.get("AIOS_LLM_TIMEOUT", "300"))) as r:
             data = json.loads(r.read())
-        return data["choices"][0]["message"]["content"]
+        # Some OpenAI-compatible backends (claude-code in particular, which is an
+        # agent rather than a chat model) return content: null. Callers do string
+        # work on the result, so None must never escape this function.
+        return data["choices"][0]["message"].get("content") or ""
     except urllib.error.HTTPError as e:
         return f"⚠️ LLM error {e.code}: {e.read().decode(errors='replace')[:400]}"
     except Exception as e:
@@ -680,6 +700,8 @@ def run_swarm(message: str) -> dict:
                             "elapsed": r.get("elapsed"), "finished": True})
     if r.get("swarm"):
         brain.audit("swarm", "run", f"{len(r.get('tasks', []))} subtasks: {message[:120]}")
+        if os.environ.get("AIOS_PAPERCLIP_MIRROR", "1") == "1":
+            threading.Thread(target=paperclip.record_swarm, args=(message, r), daemon=True).start()
     return r
 
 
@@ -701,6 +723,14 @@ def route(target: str, message: str, history: list | None = None) -> str:
         return ask_opencode(message)
     if target in ("claudecode", "claude-code"):
         return ask_claudecode(message, history)
+    if target in ("company", "paperclip"):
+        act("agent", "Filing a ticket with the company (Paperclip)…")
+        r = paperclip.create_task(message.split("\n")[0][:120], message, assignee="brain")
+        if not r.get("ok"):
+            return "⚠️ " + r.get("error", "Paperclip unavailable")
+        return (f"📋 Filed **{r['issue']['key']}** and woke **{r['assignee']}** (CEO). "
+                f"It'll plan, delegate across the org and post the result on the ticket.\n\n"
+                f"Track it in the **Company** view, or [open it in Paperclip]({r['url']}).")
     if target == "codex":
         act("agent", "Handing off to Codex…")
         return ask_codex(message, history)
@@ -1221,7 +1251,7 @@ def run_team(message: str, history: list | None = None) -> str:
         "one directive per line in the form `CALL <agent>: <subtask>`. Available agents:\n" + roster +
         "\nIf you can answer directly with no agent, write `ANSWER: <your answer>`. "
         "Only delegate when it genuinely helps. Output directives only.")
-    plan = llm_chat((history or []) + [{"role": "user", "content": message}], system=plan_sys)
+    plan = llm_chat((history or []) + [{"role": "user", "content": message}], system=plan_sys) or ""
     if plan.lstrip().upper().startswith("ANSWER:"):
         return plan.split(":", 1)[1].strip()
 
@@ -1525,6 +1555,8 @@ class Handler(BaseHTTPRequestHandler):
         elif self.path == "/api/activity":
             self._send(200, activity(self._query.get("turn", [""])[0],
                                      int(self._query.get("since", ["0"])[0] or 0)))
+        elif self.path == "/api/paperclip":
+            self._send(200, paperclip.overview())
         elif self.path == "/api/plugins":
             self._send(200, {"plugins": plugins.catalog()})
         elif self.path == "/api/vault":
@@ -1790,6 +1822,35 @@ class Handler(BaseHTTPRequestHandler):
                 tools._inflight_done(_tr)
             brain.audit(payload.get("by", "agent"), "web." + op,
                         f"{q[:120]} -> ok={r.get('ok')}")
+            self._send(200, r)
+        elif self.path == "/api/paperclip/heartbeat":
+            # Paperclip's HTTP adapter waking a hub-driven employee. The work happens
+            # inside this request: agent writes need the run to still be open.
+            brain.audit("paperclip", "heartbeat",
+                        f"{payload.get('aiosSlug')} run={str(payload.get('runId'))[:8]}")
+            try:
+                r = paperclip.handle_heartbeat(payload, route=lambda t, m: route(t, m), act=act)
+            except Exception as e:
+                r = {"ok": False, "error": str(e)[:300]}
+            self._send(200 if r.get("ok") else 500, r)
+        elif self.path == "/api/paperclip":
+            op = payload.get("op", "")
+            try:
+                if op == "setup":
+                    r = paperclip.bootstrap(f"http://127.0.0.1:{PORT}", sec.get_token())
+                elif op == "task":
+                    r = paperclip.create_task(payload.get("title", ""), payload.get("description", ""),
+                                              assignee=payload.get("assignee", "brain"),
+                                              priority=payload.get("priority", "medium"))
+                elif op == "issue":
+                    r = paperclip.issue_detail(payload.get("id", ""))
+                elif op == "status":
+                    r = paperclip.set_status(payload.get("id", ""), payload.get("status", ""))
+                else:
+                    r = {"ok": False, "error": "op must be setup | task | issue | status"}
+            except Exception as e:
+                r = {"ok": False, "error": str(e)[:300]}
+            brain.audit("hub", "paperclip." + op, f"ok={r.get('ok')}")
             self._send(200, r)
         elif self.path == "/api/plugins":
             op = payload.get("op", "install")

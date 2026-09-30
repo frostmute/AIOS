@@ -2,7 +2,7 @@
 
 # 🧠 The AI OS
 
-### Ten open-source AI projects. One operating system. One Control Room.
+### Eleven open-source AI projects. One operating system. One Control Room.
 
 <p align="center">
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-8B5CF6?style=for-the-badge" alt="MIT License"></a>
@@ -25,6 +25,7 @@
   <img src="https://img.shields.io/badge/+_Ponytail-build_less-DB2777?style=flat-square" alt="Ponytail">
   <img src="https://img.shields.io/badge/+_Ruflo-314_MCP_tools-7C3AED?style=flat-square" alt="Ruflo">
   <img src="https://img.shields.io/badge/+_Codex-ChatGPT_sub-10A37F?style=flat-square" alt="Codex">
+  <img src="https://img.shields.io/badge/+_Paperclip-company_layer-F97316?style=flat-square" alt="Paperclip">
 </p>
 
 **[Install](#-install-one-line)** · **[Control Room](#-the-control-room)** · **[Architecture](#️-architecture)** · **[Commands](#️-command-reference)** · **[Full docs](README.aios.md)** · **[Website](https://zdstudios.github.io/AIOS/)**
@@ -33,7 +34,7 @@
 
 ---
 
-**The AI OS** takes ten independent open-source AI projects and makes them work as **one auto-configured
+**The AI OS** takes eleven independent open-source AI projects and makes them work as **one auto-configured
 system** you drive from a single command — **`aios`** — and a single web **Control Room** where you can
 **talk to everything and have the agents talk to each other**.
 
@@ -43,7 +44,7 @@ together, mounts your shared skills, and adds **OpenUI** generative-UI context t
 
 > You can't fuse three runtimes and multiple package managers into a single file — that would just break
 > everything. So "one file" here means **one control surface** (`aios`) + **one dashboard** (the Hub) over
-> ten real, unmodified projects. It installs, configures, wires, runs, tests, and debugs all of them.
+> eleven real, unmodified projects. It installs, configures, wires, runs, tests, and debugs all of them.
 
 <div align="center">
 
@@ -117,6 +118,7 @@ aios url                 # open the Control Room
 | **CrewAI** | Multi-agent orchestration — role-based crews | `4788` | [crewaiinc/crewai](https://github.com/crewaiinc/crewai) |
 | **claude-code** | Claude Code as an OpenAI-compatible API | `8000` | [codingworkflow/claude-code-api](https://github.com/codingworkflow/claude-code-api) |
 | **Codex** | OpenAI Codex CLI as an OpenAI-compatible API — your ChatGPT sub, no API key | `8010` | [openai/codex](https://github.com/openai/codex) |
+| **Paperclip** | The company layer — org chart, tickets, heartbeats, budgets, governance | `3100` | [paperclipai/paperclip](https://github.com/paperclipai/paperclip) |
 | **LifeOS** | Shared identity + skills mounted into the agents | — | [danielmiessler/LifeOS](https://github.com/danielmiessler/LifeOS) |
 
 Plus the integrations that glue it together — these aren't services, they're mounted into every agent:
@@ -186,6 +188,7 @@ Plus the integrations that glue it together — these aren't services, they're m
 | `aios status` | Table of each service: state, port, PID, health. |
 | `aios doctor` | Diagnose tools, config, deps and ports — with the exact fix for each. |
 | `aios update [--check]` | `git pull` + reinstall changed deps + re-render + re-mount skills. `--check` just reports if updates exist (also auto-checked on start). |
+| `aios paperclip [status\|setup\|task\|open\|install]` | The company layer: hire every agent into a Paperclip org chart, file tickets, open its board. |
 | `aios updates [--apply P]` | **Supervised** upstream updates — an agent reviews the commits and returns SAFE/RISKY/BLOCK before anything is applied; `--rollback P` restores a previous version. |
 | `aios autostart enable\|disable` | Run The AI OS on login/boot (Startup shortcut on Windows, systemd/`.bashrc` on Linux/WSL). |
 | `aios exec <cmd>` | Run a command through the agents' own **guardrailed, audited** shell. |
@@ -312,6 +315,49 @@ aios ruflo <anything>      # passed through to `npx ruflo@latest`
 AIOS is the always-on system (services, channels, dashboard, Task Brain); ruflo is a
 per-project harness you invoke for a heavy job. They compose.
 
+## 🏢 Paperclip — run the agents as a company
+
+[paperclipai/paperclip](https://github.com/paperclipai/paperclip) models agents as employees:
+an org chart, tickets with a status machine, heartbeats that wake an agent when it has work,
+monthly budgets and board governance. AIOS runs it as a service on `:3100` and **hires its own
+agents into it**, so work handed to "the company" is tracked the same way a team tracks work.
+
+```bash
+aios paperclip setup          # create "The AI OS" company and hire the team (idempotent)
+aios paperclip task "Audit the auth module for injection bugs"
+aios paperclip status         # org chart + ticket counts
+aios paperclip open           # Paperclip's own board in the browser
+```
+
+| Paperclip seat | Who | How it runs |
+|---|---|---|
+| CEO | **AIOS Brain** | HTTP adapter → the hub → Brain/Team, which can delegate across every agent |
+| CTO | **opencode** | HTTP adapter → the hub → opencode |
+| Head of Research | **CrewAI** | HTTP adapter → the hub → CrewAI |
+| Senior Engineer | **Claude Code** | Paperclip's native `claude_local` adapter, on your Claude login |
+| Engineer | **Codex** | Paperclip's native `codex_local` adapter, on your ChatGPT login |
+
+How a ticket moves: Paperclip wakes the assignee with a heartbeat → the hub receives it at
+`/api/paperclip/heartbeat`, checks the ticket out, routes it to the right agent, posts the result
+as a comment and closes it (or marks it **blocked** with the reason, owned by the board). It all
+happens inside the heartbeat request, so Paperclip's run log matches what the agent actually did.
+
+- **Hub → Company view** — the org chart, a live ticket board (to do / in progress / blocked / done),
+  a new-ticket form, each ticket's comment thread, reopen/done/cancel, and Paperclip's own UI embedded.
+- **🏢 Company chat chip** — send any chat message as a ticket; the CEO takes it from there.
+- **Swarm history** — finished swarms are mirrored into Paperclip as a parent ticket with one child
+  per subtask (`services.paperclip.mirror_swarms`), so the company's record includes work done outside it.
+- **Zero setup** — Paperclip needs Node 24; `aios setup` downloads a private Node 24 into
+  `.aios/runtime` and installs `paperclipai` there. Your system Node is untouched. Its embedded
+  Postgres and data live in `.aios/paperclip`. Mode is `local_trusted` (loopback only).
+- **Skills** — Paperclip's own agent skills (`paperclip`, `paperclip-board`, `paperclip-create-agent`,
+  `paperclip-converting-plans-to-tasks`) are mounted into every agent.
+
+Windows notes, already handled: Paperclip's ACP engine can't spawn `.cmd` shims (Node's
+CVE-2024-27980 hardening), so AIOS uses its CLI engine and points it at the real `codex.exe` /
+`claude.exe`; Codex uses your real `CODEX_HOME` because Paperclip's per-company symlink seeding
+fails on Windows with `EEXIST`.
+
 ## 🎨 Agents can redesign the dashboard (safely)
 
 Ask in chat — *"make the accent blue and the text bigger"*, *"hide Automations"*, *"put a
@@ -363,6 +409,8 @@ The AI OS is an integration layer. All the heavy lifting is done by these open-s
 - **[LifeOS](https://github.com/danielmiessler/LifeOS)** by Daniel Miessler — the AI-powered life OS
 - **[openclaw-os](https://github.com/thesysdev/openclaw-os)** by thesys — the generative-UI dashboard
 - **[OpenUI](https://www.openui.com)** — the open standard for LLM-generated interfaces
+- **[Paperclip](https://github.com/paperclipai/paperclip)** — orchestration for zero-human companies
+- **[Fabric](https://github.com/danielmiessler/fabric)**, **[Caveman](https://github.com/JuliusBrussee/caveman)**, **[Ponytail](https://github.com/DietrichGebert/ponytail)**, **[Ruflo](https://github.com/ruvnet/ruflo)**, **[Codex](https://github.com/openai/codex)**, **[claude-code-api](https://github.com/codingworkflow/claude-code-api)**
 
 Each project keeps its own license (all MIT / open source); their `LICENSE` files ship unmodified.
 

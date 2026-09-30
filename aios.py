@@ -270,6 +270,7 @@ PROJECTS = {
     "caveman": resolve_root("caveman-main/caveman-main", "caveman-main", "caveman"),
     "ponytail": resolve_root("ponytail-main/ponytail-main", "ponytail-main", "ponytail"),
     "ruflo": resolve_root("ruflo-main/ruflo-main", "ruflo-main", "ruflo"),
+    "paperclip": resolve_root("paperclip-main/paperclip-main", "paperclip-main", "paperclip"),
 }
 
 
@@ -438,6 +439,29 @@ def service_specs(cfg: dict) -> dict:
             "health": cfg_get(cfg, "health.claudecode", f"http://127.0.0.1:{port}/health"),
             "tool": "uv",
         }
+    # Paperclip — the company layer (org chart, tickets, budgets, governance).
+    # Needs Node >= 24.11, so it runs on AIOS's own portable Node 24 rather than
+    # whatever node is on PATH. Its HTTP adapter refuses loopback targets unless
+    # the exact origin is allowlisted, so the hub's origin is passed in.
+    if cfg_get(cfg, "services.paperclip.enabled", True) and paperclip_entry():
+        pcp = int(cfg_get(cfg, "services.paperclip.port", 3100))
+        hbp = int(cfg_get(cfg, "services.hub.port", 8787))
+        n24 = node24_bin()
+        specs["paperclip"] = {
+            "enabled": True,
+            "cwd": ROOT,
+            "cmd": [n24 or "node", str(paperclip_entry()), "run",
+                    "--data-dir", str(STATE / "paperclip")],
+            "port": pcp,
+            "health": cfg_get(cfg, "health.paperclip", f"http://127.0.0.1:{pcp}/api/health"),
+            "tool": "node",
+            "env": {"PORT": str(pcp), "PAPERCLIP_NO_BROWSER": "1",
+                    "PAPERCLIP_OPEN_ON_LISTEN": "false",
+                    "PAPERCLIP_HTTP_ADAPTER_PRIVATE_ENDPOINT_ALLOWLIST": f"http://127.0.0.1:{hbp}",
+                    "PATH": (str(Path(n24).parent) + os.pathsep if n24 else "")
+                            + os.environ.get("PATH", "")},
+        }
+
     # Codex CLI as an OpenAI-compatible API (mirror of claude-code-api). Pure
     # stdlib, so it runs on the same interpreter as aios itself.
     if cfg_get(cfg, "services.codex.enabled", True):
@@ -506,7 +530,7 @@ def service_specs(cfg: dict) -> dict:
 
 
 START_ORDER = ["opencode", "hermes", "hermes-gateway", "hermes-proxy", "openclaw",
-               "openclaw-proxy", "crewai", "claudecode", "codex", "hub"]
+               "openclaw-proxy", "crewai", "claudecode", "codex", "paperclip", "hub"]
 
 
 def openclaw_env() -> dict:
@@ -538,6 +562,8 @@ def interconnect_env(cfg: dict) -> dict:
         "AIOS_CREWAI_PORT": str(crp),
         "AIOS_CLAUDECODE_URL": f"http://127.0.0.1:{ccp}",
         "AIOS_CODEX_URL": f"http://127.0.0.1:{cfg_get(cfg, 'services.codex.port', 8010)}",
+        "AIOS_PAPERCLIP_URL": f"http://127.0.0.1:{cfg_get(cfg, 'services.paperclip.port', 3100)}",
+        "AIOS_PAPERCLIP_MIRROR": "1" if cfg_get(cfg, "services.paperclip.mirror_swarms", True) else "0",
         "AIOS_OPENCLAWPROXY_URL": f"http://127.0.0.1:{pxp}/",
         "AIOS_HERMESPROXY_URL": f"http://127.0.0.1:{hxp}/",
         "AIOS_OPENCLAWOS_URL": f"http://127.0.0.1:{clp}/plugins/openclawos/",
@@ -642,9 +668,13 @@ def spawn(svc: str, spec: dict, cfg: dict, secrets: dict, extra_env: dict | None
 
     # Resolve the leading tool to an absolute path (Windows needs the ext).
     cmd = list(spec["cmd"])
-    tool_path = find_tool(spec["tool"])
-    if tool_path:
-        cmd[0] = tool_path
+    # An absolute path in cmd[0] is a deliberate choice (e.g. Paperclip pinned to
+    # the portable Node 24) — re-resolving it by tool name would silently swap in
+    # whatever `node` is on PATH.
+    if not os.path.isabs(str(cmd[0])):
+        tool_path = find_tool(spec["tool"])
+        if tool_path:
+            cmd[0] = tool_path
 
     kwargs = dict(cwd=str(spec["cwd"]), stdout=logf, stderr=subprocess.STDOUT, env=env)
     if IS_WIN:
@@ -832,6 +862,7 @@ def cmd_setup(args):
         mount_aios_skills(cfg)
         mount_agent_modes(cfg)  # caveman + ponytail skills → every agent
         mount_ruflo(cfg)        # ruflo orchestration skill → every agent
+        mount_paperclip(cfg)    # paperclip company skills → every agent
 
     # 7) wire openclaw-os plugin (best-effort; needs openclaw runnable)
     if cfg_get(cfg, "services.openclaw_os.enabled", True) and not args.skip_wire:
@@ -839,6 +870,11 @@ def cmd_setup(args):
 
     # 7b) hand the agents the machine, and mint the token that keeps that safe
     ensure_hub_token()
+    if cfg_get(cfg, "services.paperclip.enabled", True) and not args.skip_install:
+        try:
+            ensure_paperclip(quiet=True)
+        except Exception as e:
+            warn(f"Paperclip install skipped: {e}")
     ensure_master_password(interactive=not args.non_interactive)
     if not args.skip_wire:
         wire_full_control(cfg)
@@ -1408,6 +1444,160 @@ def wire_openclaw_os(quiet=False):
     return False
 
 
+# --------------------------------------------------------------------------- #
+# Paperclip runtime — portable Node 24 + the paperclipai package, under .aios/   #
+# --------------------------------------------------------------------------- #
+NODE24_VERSION = "v24.21.0"
+RUNTIME = STATE / "runtime"
+
+
+def _node_major_minor(exe: str) -> tuple:
+    try:
+        v = subprocess.run([exe, "-v"], capture_output=True, text=True, timeout=15).stdout.strip()
+        a, b = v.lstrip("v").split(".")[:2]
+        return int(a), int(b)
+    except Exception:
+        return 0, 0
+
+
+def node24_bin() -> str:
+    """A Node >= 24.11 to run Paperclip on. Prefer ours, so upgrading the system
+    Node (which openclaw and opencode also use) is never required."""
+    own = RUNTIME / "node24" / ("node.exe" if IS_WIN else "bin/node")
+    if own.exists():
+        return str(own)
+    sysnode = find_tool("node")
+    if sysnode and _node_major_minor(sysnode) >= (24, 11):
+        return sysnode
+    return ""
+
+
+def paperclip_entry():
+    p = RUNTIME / "paperclip" / "node_modules" / "paperclipai" / "dist" / "index.js"
+    return p if p.exists() else None
+
+
+def ensure_node24() -> str:
+    if node24_bin():
+        return node24_bin()
+    import platform as _pf
+    import tarfile
+    import zipfile
+    arch = {"amd64": "x64", "x86_64": "x64", "arm64": "arm64", "aarch64": "arm64"}.get(
+        _pf.machine().lower(), "x64")
+    osname = "win" if IS_WIN else ("darwin" if sys.platform == "darwin" else "linux")
+    ext = "zip" if IS_WIN else ("tar.xz" if osname == "linux" else "tar.gz")
+    stem = f"node-{NODE24_VERSION}-{osname}-{arch}"
+    url = f"https://nodejs.org/dist/{NODE24_VERSION}/{stem}.{ext}"
+    RUNTIME.mkdir(parents=True, exist_ok=True)
+    dl = RUNTIME / f"{stem}.{ext}"
+    say(f"{C.GRY}downloading {url}{C.R}")
+    urllib.request.urlretrieve(url, dl)
+    if ext == "zip":
+        with zipfile.ZipFile(dl) as z:
+            z.extractall(RUNTIME)
+    else:
+        with tarfile.open(dl) as t:
+            t.extractall(RUNTIME)
+    dl.unlink(missing_ok=True)
+    target = RUNTIME / "node24"
+    if target.exists():
+        shutil.rmtree(target, ignore_errors=True)
+    (RUNTIME / stem).rename(target)
+    ok(f"portable Node {NODE24_VERSION} -> {target}")
+    return node24_bin()
+
+
+def ensure_paperclip(quiet: bool = False) -> bool:
+    """Install paperclipai into .aios/runtime/paperclip with Node 24's own npm.
+
+    A package.json is written first on purpose: without one, npm walks UP the
+    directory tree looking for a project root, and on this machine that meant it
+    installed 1.5GB into the user's home directory instead."""
+    if paperclip_entry():
+        if not quiet:
+            ok("Paperclip runtime present")
+        return True
+    head("Installing Paperclip (the company layer)")
+    node = ensure_node24()
+    if not node:
+        warn("could not get Node >= 24.11 — Paperclip skipped")
+        return False
+    d = RUNTIME / "paperclip"
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "package.json").write_text('{"name":"aios-paperclip-runtime","private":true}\n',
+                                   encoding="utf-8")
+    bindir = Path(node).parent
+    npm_cli = (bindir / "node_modules" / "npm" / "bin" / "npm-cli.js") if IS_WIN else \
+        (bindir.parent / "lib" / "node_modules" / "npm" / "bin" / "npm-cli.js")
+    env = child_env({"PATH": str(bindir) + os.pathsep + os.environ.get("PATH", "")})
+    rc = run_stream([node, str(npm_cli), "install", "--prefix", str(d), "--no-audit",
+                     "--no-fund", "--loglevel=error", "paperclipai@latest"],
+                    d, env, "paperclip-install")
+    if rc == 0 and paperclip_entry():
+        ok("Paperclip installed")
+        return True
+    warn(f"Paperclip install exited {rc} — retry with `aios paperclip install`")
+    return False
+
+
+def cmd_paperclip(args):
+    """The company layer: org chart, tickets, budgets, governance over AIOS agents."""
+    sys.path.insert(0, str(ROOT))
+    import aios_paperclip as P
+    cfg = load_config()
+    action = getattr(args, "action", "status")
+    rest = " ".join(getattr(args, "rest", []) or [])
+    hub = f"http://127.0.0.1:{cfg_get(cfg, 'services.hub.port', 8787)}"
+
+    if action == "install":
+        ensure_paperclip()
+        return
+    if action == "setup":
+        if not paperclip_entry():
+            ensure_paperclip()
+        if not P.health()["up"]:
+            cmd_start(argparse.Namespace(service=["paperclip"], timeout=180, restart=False))
+        r = P.bootstrap(hub, load_env(ROOT / ".env").get("AIOS_HUB_TOKEN", ""))
+        if not r.get("ok"):
+            die(r.get("error", "bootstrap failed"))
+        head(f"Company ready — {P.COMPANY_NAME}")
+        for slug, a in r["agents"].items():
+            m = next(x for x in P.ROSTER if x["slug"] == slug)
+            say(f"  {C.CYN}{m['name']:<13}{C.R}{m['title']:<18}{C.GRY}{a['adapter']}{C.R}")
+        if r["created"]:
+            ok("hired: " + ", ".join(r["created"]))
+        say(f"\n  {C.GRY}Give it work:{C.R} aios paperclip task \"...\"   "
+            f"{C.GRY}or pick the Company target in chat{C.R}")
+        return
+    if action == "task":
+        if not rest:
+            die('usage: aios paperclip task "what you want done"')
+        r = P.create_task(rest.split(". ")[0][:120], rest)
+        if not r.get("ok"):
+            die(r.get("error"))
+        ok(f"filed {r['issue']['key']} -> {r['assignee']} (heartbeat invoked)")
+        say(f"  {C.CYN}{r['url']}{C.R}")
+        return
+    if action == "open":
+        import webbrowser
+        webbrowser.open(P.ui_url())
+        return
+    o = P.overview()
+    head("Paperclip")
+    h = o["health"]
+    state_txt = (C.GRN + "up") if h["up"] else (C.YEL + "down")
+    say(f"  server   : {state_txt}{C.R}  {C.GRY}{h.get('version') or h.get('error', '')}{C.R}")
+    if not o["bootstrapped"]:
+        say(f"  company  : {C.YEL}not set up{C.R} — run {C.B}aios paperclip setup{C.R}")
+        return
+    say(f"  company  : {(o.get('company') or {}).get('name')}  {C.GRY}{P.ui_url()}{C.R}")
+    for a in o["agents"]:
+        say(f"    {a['name']:<13}{C.GRY}{(a.get('title') or ''):<18}{a.get('status')}{C.R}")
+    if o["counts"]:
+        say("  tickets  : " + "  ".join(f"{k}={v}" for k, v in sorted(o["counts"].items())))
+
+
 def wire_full_control(cfg: dict, quiet=False):
     """Flip openclaw into unattended exec. Everything else takes an env var; openclaw
     keeps exec policy in its config + approvals file, and `exec-policy preset yolo`
@@ -1689,6 +1879,7 @@ def cmd_update(args):
         mount_aios_skills(cfg)
         mount_agent_modes(cfg)  # caveman + ponytail — same set setup mounts
         mount_ruflo(cfg)
+        mount_paperclip(cfg)
     # Restart any services that are currently running so the new code takes effect.
     specs = service_specs(cfg)
     running = [s for s in specs if (read_pid(s) and pid_alive(read_pid(s)["pid"]))]
@@ -1962,6 +2153,24 @@ def mount_ruflo(cfg: dict):
             warn(f"could not mount ruflo → {t}: {e}")
     n = len(list((src / "plugins").glob("*/skills/*/SKILL.md"))) if (src / "plugins").exists() else 0
     ok(f"ruflo skill mounted ({n} plugin skills available via `aios ruflo plugins`)")
+
+
+def mount_paperclip(cfg: dict):
+    """Mount Paperclip's agent skills (paperclip, paperclip-board, create-agent,
+    converting-plans-to-tasks) so every agent knows how the company layer works:
+    checking out tickets, commenting, delegating down the org chart."""
+    src = (PROJECTS.get("paperclip") or (ROOT / "paperclip-main")) / "skills"
+    if not src.exists():
+        return
+    skills = [d for d in src.iterdir() if d.is_dir() and d.name.startswith("paperclip")]
+    for base in (Path.home() / ".openclaw" / "skills", Path.home() / ".hermes" / "skills",
+                 STATE / "skills"):
+        for d in skills:
+            try:
+                shutil.copytree(d, base / d.name, dirs_exist_ok=True)
+            except Exception as e:
+                warn(f"could not mount {d.name} → {base}: {e}")
+    ok(f"paperclip skills mounted ({len(skills)})")
 
 
 def cmd_ruflo(args):
@@ -2549,10 +2758,10 @@ def _print_urls(cfg):
 HELP_GROUPS = [
     ("Get started", ["setup", "start", "stop", "restart", "status", "url"]),
     ("Everyday", ["logs", "doctor", "exec", "web", "channels", "profile", "token", "password"]),
-    ("Agents & updates", ["updates", "update", "claude-login", "ruflo", "attach", "migrate", "wire"]),
+    ("Agents & updates", ["paperclip", "updates", "update", "claude-login", "ruflo", "attach", "migrate", "wire"]),
     ("Advanced", ["test", "debug", "autostart", "install-cli", "bootstrap", "uninstall"]),
 ]
-TAGLINE = "Ten open-source AI projects. One operating system."
+TAGLINE = "Eleven open-source AI projects. One operating system."
 
 
 class AiosParser(argparse.ArgumentParser):
@@ -2692,6 +2901,12 @@ def build_parser():
     s.add_argument("arg", nargs=argparse.REMAINDER)
     s.add_argument("--timestamps", action="store_true", help="keep [mm:ss] on transcripts")
     s.set_defaults(func=cmd_web)
+
+    s = sub.add_parser("paperclip", help="the company layer: org chart, tickets, budgets")
+    s.add_argument("action", nargs="?", default="status",
+                   choices=["status", "setup", "task", "open", "install"])
+    s.add_argument("rest", nargs=argparse.REMAINDER)
+    s.set_defaults(func=cmd_paperclip)
 
     s = sub.add_parser("ruflo", help="ruflo meta-harness: 314+ MCP tools, swarms, plugins")
     s.add_argument("args", nargs=argparse.REMAINDER,

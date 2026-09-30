@@ -210,6 +210,28 @@
   .patrow b{font-size:.84rem;color:var(--text)}
   .patrow small{color:var(--text3);font-size:.72rem;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
   #modeBtns .btn.primary{background:var(--accent);color:var(--bg);border-color:var(--accent)}
+  /* Company (Paperclip) */
+  .co-grid{display:grid;grid-template-columns:minmax(260px,340px) 1fr;gap:14px;margin-top:14px;align-items:start}
+  @media(max-width:900px){.co-grid{grid-template-columns:1fr}}
+  .co-stats{display:flex;flex-wrap:wrap;gap:8px}
+  .co-stat{background:var(--surface);border:1px solid var(--border);border-radius:10px;padding:8px 14px;display:flex;flex-direction:column;min-width:84px}
+  .co-stat b{font-size:18px}.co-stat span{font-size:11.5px;color:var(--text3)}
+  .co-org{display:flex;flex-direction:column;gap:8px;margin-top:8px}
+  .co-reports{display:flex;flex-direction:column;gap:6px;margin-left:14px;padding-left:12px;border-left:2px solid var(--border)}
+  .co-node{display:flex;align-items:center;gap:8px;flex-wrap:wrap;font-size:13px}
+  .co-node>span:not(.pill):not(.co-dot){color:var(--text3);font-size:12px}
+  .co-dot{width:8px;height:8px;border-radius:50%;background:var(--text3);flex:none}
+  .co-dot.run{background:var(--success);box-shadow:0 0 0 3px color-mix(in srgb,var(--success) 25%,transparent)}.co-dot.err{background:var(--danger)}
+  .co-cols{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px}
+  @media(max-width:1200px){.co-cols{grid-template-columns:repeat(2,minmax(0,1fr))}}
+  .co-col{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:10px;display:flex;flex-direction:column;gap:6px;min-height:120px}
+  .co-colh{display:flex;justify-content:space-between;font-size:12px;font-weight:600;text-transform:uppercase;letter-spacing:.04em;color:var(--text2)}
+  .co-tk{all:unset;cursor:pointer;background:var(--sunk);border:1px solid var(--border);border-radius:8px;padding:7px 9px;font-size:13px;line-height:1.35;display:block}
+  .co-tk:hover,.co-tk.on{border-color:var(--accent)}
+  .co-tk small{display:block;color:var(--text3);font-size:11.5px;margin-top:2px}
+  .co-empty{color:var(--text3);font-size:12px;margin:4px 2px}
+  .co-cm{border-left:3px solid var(--accent);padding:4px 10px;font-size:13px}
+  .co-cm small{color:var(--text3)}
 </style>
 </head>
 <body>
@@ -244,6 +266,7 @@
     <div class="sec">System</div>
     <button class="nav" data-v="memory" onclick="nav('memory')"><span class="ic">🧠</span> Memory</button>
     <button class="nav" data-v="channels" onclick="nav('channels')"><span class="ic">📡</span> Channels</button>
+    <button class="nav" data-v="company" data-svc="paperclip" onclick="nav('company')"><span class="ic">🏢</span> Company <span class="dot"></span></button>
     <button class="nav" data-v="swarm" onclick="nav('swarm')"><span class="ic">🐝</span> Swarm</button>
     <button class="nav" data-v="tasks" onclick="nav('tasks')"><span class="ic">⚙</span> Task Brain</button>
     <button class="nav" data-v="flows" onclick="nav('flows')"><span class="ic">🔀</span> TaskFlow</button>
@@ -283,6 +306,7 @@
             <button class="chip" data-t="claudecode">◈ claude-code</button>
             <button class="chip" data-t="codex" title="OpenAI Codex via your ChatGPT subscription">⌁ Codex</button>
             <button class="chip" data-t="swarm" title="Big task: decompose across specialist agents running in parallel">🐝 Swarm</button>
+            <button class="chip" data-t="company" title="File it as a ticket for the company — the CEO delegates, the result lands on the ticket">🏢 Company</button>
             <button class="chip" data-t="fabric" title="Run a Fabric pattern (type: pattern: your text)">🧵 Fabric</button>
             <button class="chip" data-t="all">🌐 All</button>
           </div>
@@ -389,6 +413,33 @@
         </div>
         <div id="taskList" style="margin-top:14px"></div>
       </div>
+    </div>
+
+    <!-- COMPANY (Paperclip) -->
+    <div id="company" class="view">
+      <div class="vhead"><h2>🏢 Company</h2><span class="sub">Paperclip: org chart, tickets, heartbeats, budgets</span>
+        <div class="right"><button class="btn sm" id="coTabBoard" onclick="coTab('board')">Board</button><button class="btn sm" id="coTabUI" onclick="coTab('ui')">Paperclip UI</button><a class="btn sm" id="coNew" target="_blank" href="http://127.0.0.1:3100">Open ↗</a></div></div>
+      <div class="vbody pad" id="coBoard">
+        <div id="coStatus"></div>
+        <div class="co-grid">
+          <div>
+            <div class="card"><h3>Org chart</h3><div id="coOrg" class="co-org"></div></div>
+            <div class="card" style="margin-top:14px"><h3>New ticket</h3>
+              <input id="coTitle" placeholder="What needs doing?">
+              <textarea id="coDesc" style="margin-top:8px;min-height:80px" placeholder="Details, acceptance criteria, links… (optional)"></textarea>
+              <div class="inrow" style="margin-top:8px">
+                <select id="coAssignee"></select>
+                <select id="coPriority"><option>low</option><option selected>medium</option><option>high</option><option>urgent</option></select>
+                <button class="btn primary" onclick="coFile()">File &amp; wake</button>
+              </div>
+              <p style="color:var(--text3);font-size:12px;margin-top:8px">Assign the CEO and it delegates. Assign a report and it goes straight to them. Either way the agent checks the ticket out, does the work, comments the result and closes it.</p>
+            </div>
+          </div>
+          <div class="co-cols" id="coCols"></div>
+        </div>
+        <div id="coDetail"></div>
+      </div>
+      <div class="embed" id="coUI" style="display:none"><iframe id="coFrame"></iframe></div>
     </div>
 
     <!-- SWARM -->
@@ -764,6 +815,7 @@
     if(v==='tasks')loadTasks();
     if(v==='flows')loadFlows();
     if(v==='swarm')loadSwarm();
+    if(v==='company'){coTab(coView);loadCompany();}
     if(v==='actions'){setWatchUI();renderActions();if(watchOn)pollActions();}
     if(v==='skills')loadSkillsView();
     if(v==='patterns')loadPatterns();
@@ -984,6 +1036,50 @@
     </div>`).join(''):'<p style="color:var(--text3)">No tasks yet. The Task Brain runs cron jobs, interval prompts, and shell commands on one scheduler.</p>';}catch(e){}}
   async function addTask(){const name=document.getElementById('tkName').value.trim()||'task';const kind=document.getElementById('tkKind').value;const body=document.getElementById('tkBody').value.trim();const cron=document.getElementById('tkSchedule').value.trim();const every=parseInt(document.getElementById('tkEvery').value)||0;const p={op:'add',name,kind,cron,every_minutes:every};if(kind==='agent'){p.target=document.getElementById('tkTarget').value.trim()||'brain';p.prompt=body;}else{p.command=body;}await api('/api/tasks',p);document.getElementById('tkName').value='';document.getElementById('tkBody').value='';toast('Task added');loadTasks();}
   async function taskOp(op,id){const r=await api('/api/tasks',{op,id});if(op==='run')toast('Ran: '+(r.status||''));loadTasks();}
+
+  // ── Company (Paperclip) ──
+  let coView='board', coTimer=null, coOpen='';
+  const CO_COLS=[['todo','To do'],['in_progress','In progress'],['blocked','Blocked'],['done','Done']];
+  function coTab(v){coView=v;
+    document.getElementById('coBoard').style.display=v==='board'?'':'none';
+    document.getElementById('coUI').style.display=v==='ui'?'':'none';
+    document.getElementById('coTabBoard').classList.toggle('primary',v==='board');
+    document.getElementById('coTabUI').classList.toggle('primary',v==='ui');
+    if(v==='ui')frame('coFrame','coNew',peers.paperclip||'http://127.0.0.1:3100');}
+  async function loadCompany(){
+    clearTimeout(coTimer);
+    let r; try{r=await(await fetch('/api/paperclip')).json();}catch(e){return;}
+    const st=document.getElementById('coStatus');
+    if(!r.health||!r.health.up){st.innerHTML=`<div class="card"><h3>Paperclip isn't running</h3><p style="color:var(--text2)">Start it with <span class="mono">aios start paperclip</span> (the first run installs Node 24 + paperclipai into <span class="mono">.aios/runtime</span>).</p><button class="btn" onclick="act('start','paperclip')">Start Paperclip</button></div>`;return;}
+    if(!r.bootstrapped){st.innerHTML=`<div class="card"><h3>No company yet</h3><p style="color:var(--text2)">Create “The AI OS” company in Paperclip and hire every agent into it: Brain as CEO, opencode as CTO, CrewAI on research, Claude and Codex as engineers.</p><button class="btn primary" onclick="coSetup()">Set up company</button></div>`;return;}
+    const c=r.counts||{};
+    st.innerHTML=`<div class="co-stats">${[['todo','queued'],['in_progress','working'],['blocked','blocked'],['done','done']].map(([k,l])=>`<div class="co-stat"><b>${c[k]||0}</b><span>${l}</span></div>`).join('')}<div class="co-stat"><b>${(r.agents||[]).length}</b><span>agents</span></div><div class="co-stat"><b>${esc((r.health||{}).version||'')}</b><span>paperclip</span></div></div>`+(r.error?`<p style="color:var(--danger)">${esc(r.error)}</p>`:'');
+    const ags=r.agents||[], ceo=ags.find(a=>!a.reportsTo);
+    const card=a=>`<div class="co-node"><span class="co-dot ${a.status==='running'?'run':(a.status==='error'?'err':'')}" title="${esc(a.status||'')}"></span><b>${esc(a.name)}</b><span>${esc(a.title||a.role||'')}</span><span class="pill">${esc(a.adapter||'')}</span></div>`;
+    document.getElementById('coOrg').innerHTML=ceo?`${card(ceo)}<div class="co-reports">${ags.filter(a=>a.reportsTo).map(card).join('')}</div>`:'';
+    const sel=document.getElementById('coAssignee'), keep=sel.value;
+    sel.innerHTML=ags.filter(a=>a.slug).map(a=>`<option value="${esc(a.slug)}">${esc(a.name)}${a.slug==='brain'?' (CEO)':''}</option>`).join('');
+    if(keep)sel.value=keep;
+    const iss=(r.issues||[]).filter(i=>i.status!=='cancelled');
+    document.getElementById('coCols').innerHTML=CO_COLS.map(([k,l])=>{const xs=iss.filter(i=>i.status===k);
+      return `<div class="co-col"><div class="co-colh">${l}<span>${xs.length}</span></div>${xs.slice(0,25).map(i=>`<button class="co-tk ${coOpen===i.id?'on':''}" data-id="${esc(i.id)}" onclick="coShow(this.dataset.id)"><span class="mono">${esc(i.key||'')}</span> ${esc(i.title||'')}<small>${esc(i.assignee||'unassigned')} · ${esc(i.priority||'')}</small></button>`).join('')||'<p class="co-empty">—</p>'}</div>`;}).join('');
+    if(coOpen)coShow(coOpen,true);
+    if(document.getElementById('company').classList.contains('active'))coTimer=setTimeout(loadCompany,iss.some(i=>i.status==='in_progress')?4000:15000);
+  }
+  async function coSetup(){toast('Hiring the team into Paperclip…');const r=await api('/api/paperclip',{op:'setup'});toast(r.ok?'Company ready':'Setup failed: '+(r.error||''));loadCompany();}
+  async function coFile(){const t=document.getElementById('coTitle').value.trim();if(!t){toast('Give the ticket a title');return;}
+    const r=await api('/api/paperclip',{op:'task',title:t,description:document.getElementById('coDesc').value.trim(),assignee:document.getElementById('coAssignee').value,priority:document.getElementById('coPriority').value});
+    if(!r.ok){toast('Could not file: '+(r.error||''));return;}
+    document.getElementById('coTitle').value='';document.getElementById('coDesc').value='';
+    toast(`Filed ${r.issue.key} → ${r.assignee}`);coOpen=r.issue.id;loadCompany();}
+  async function coShow(id,quiet){coOpen=id;const el=document.getElementById('coDetail');
+    const r=await api('/api/paperclip',{op:'issue',id});if(!r.ok){if(!quiet)el.innerHTML='';return;}const i=r.issue;
+    el.innerHTML=`<div class="card" style="margin-top:14px"><h3><span class="mono">${esc(i.key)}</span> ${esc(i.title)} <span class="badge ${i.status==='done'?'up':(i.status==='blocked'?'down':'')}">${esc(i.status)}</span></h3>
+      <p style="color:var(--text2);white-space:pre-wrap">${esc(i.description.slice(0,1200))}</p>
+      <div style="display:flex;flex-direction:column;gap:8px;margin-top:10px">${r.comments.map(c=>`<div class="co-cm"><small>${esc(c.by)} · ${esc((c.at||'').replace('T',' ').slice(0,16))}</small><div style="white-space:pre-wrap">${esc((c.body||'').slice(0,4000))}</div></div>`).join('')||'<p style="color:var(--text3)">No comments yet. The agent posts its result here.</p>'}</div>
+      <div class="row" style="margin-top:10px">${['todo','done','cancelled'].filter(x=>x!==i.status).map(x=>`<button class="btn sm" onclick="coSet('${esc(i.id)}','${x}')">${x==='todo'?'Reopen':(x==='done'?'Mark done':'Cancel')}</button>`).join('')}<a class="btn sm" href="${esc(i.url)}" target="_blank">Open in Paperclip ↗</a></div></div>`;
+    document.querySelectorAll('.co-tk').forEach(b=>b.classList.toggle('on',b.dataset.id===id));}
+  async function coSet(id,status){await api('/api/paperclip',{op:'status',id,status});loadCompany();}
 
   // ── Swarm ──
   const SW_ICON={waiting:'⏳',running:'⚡',done:'✅',error:'⛔'};

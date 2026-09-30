@@ -40,3 +40,4 @@ Thumbs.db
 **/.gradle/
 **/build/
 claude-code-api-main/.env
+claude-code-api-main/.env
