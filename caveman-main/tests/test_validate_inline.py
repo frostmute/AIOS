@@ -10,9 +10,18 @@ from scripts.validate import (  # noqa: E402
     ValidationResult,
     extract_code_blocks,
     extract_inline_codes,
+    extract_urls,
     validate,
     validate_inline_codes,
 )
+
+
+class TestUrlInBackticks(unittest.TestCase):
+    """A backtick is never a URL character; a URL in inline code used to be
+    extracted with the closing backtick glued on (#163)."""
+
+    def test_trailing_backtick_not_part_of_url(self):
+        self.assertEqual(extract_urls("see `https://x.io/a` now"), {"https://x.io/a"})
 
 
 class TestIndentedFence(unittest.TestCase):
@@ -53,9 +62,11 @@ class TestIndentedFenceDoesNotSwallow(unittest.TestCase):
         # it is now extracted as one (and must be preserved — it is literal
         # content the document is SHOWING). What must never happen is it opening
         # a fence that swallows the real block: `real = 1` stays its own entry.
+        # Order is document position (the indented marker appears before the
+        # real fenced block), not extraction type.
         self.assertEqual(
             extract_code_blocks(doc),
-            ["```js\nreal = 1\n```", "    ```"],
+            ["    ```", "```js\nreal = 1\n```"],
         )
         self.assertEqual(extract_inline_codes(doc), ["alpha"])
 
@@ -97,6 +108,32 @@ class TestMultiLineSpansStillCompared(unittest.TestCase):
         result = ValidationResult()
         validate_inline_codes("Set `--flag\nvalue` now.", "Set `--flag other` now.", result)
         self.assertFalse(result.is_valid, "a changed CLI argument must not pass as a warning")
+
+
+class TestMidLineFenceRun(unittest.TestCase):
+    """A backtick run in the MIDDLE of a prose line ("inside a ```diff fence")
+    is matched by neither FENCE_OPEN_REGEX nor FENCE_MARKER_LINE_REGEX, so its
+    backticks used to leak into inline-code pairing. The naive `([^`]+)`
+    pattern then opened a span at the run's trailing backtick and closed it at
+    the NEXT real span's opening backtick, shifting every following pair and
+    making the file permanently uncompressible."""
+
+    def test_midline_triple_backtick_does_not_shift_pairing(self):
+        text = "Put the result inside a ```diff fence. Then state:\n\n- count of `BEGIN PRIVATE KEY` matches\n- check `base64 -d` output\n"
+        self.assertEqual(extract_inline_codes(text), ["BEGIN PRIVATE KEY", "base64 -d"])
+
+    def test_midline_run_file_validates_against_itself(self):
+        text = "Wrap it in a ```json fence and run `jq .` after.\n"
+        result = ValidationResult()
+        validate_inline_codes(text, text, result)
+        self.assertTrue(result.is_valid, result.errors)
+
+    def test_span_after_midline_run_still_protected(self):
+        orig = "Use a ```diff fence, then run `git apply /tmp/x.patch` to apply.\n"
+        comp = "Use a ```diff fence, then apply.\n"
+        result = ValidationResult()
+        validate_inline_codes(orig, comp, result)
+        self.assertFalse(result.is_valid, "span dropped after a mid-line run must be caught")
 
 
 class TestErrorRendering(unittest.TestCase):
@@ -153,6 +190,25 @@ class TestValidateIntegration(unittest.TestCase):
             self.assertTrue(any("Inline code lost" in e for e in result.errors))
 
 
+
+class TestInnerBacktickSpans(unittest.TestCase):
+    """CommonMark lets a span carry a backtick run of another length inside it
+    (``a`b``). A content class that excludes every backtick cannot match such a
+    span at all, so a rewrite of its code went unvalidated."""
+
+    def test_double_backtick_span_with_inner_backtick_is_extracted(self):
+        self.assertEqual(extract_inline_codes("use ``a`b`` here and `c`"), ["a`b", "c"])
+
+    def test_single_backtick_span_with_inner_double_run(self):
+        self.assertEqual(extract_inline_codes("see `a``b` now"), ["a``b"])
+
+    def test_inner_backtick_span_rewrite_still_fails_validation(self):
+        orig = "# T\n\nRun ``git log --format=`%h` -1`` first.\n"
+        comp = orig.replace("%h", "%H")
+        result = ValidationResult()
+        validate_inline_codes(orig, comp, result)
+        self.assertFalse(result.is_valid, result.errors)
+
 if __name__ == "__main__":
     unittest.main()
 
@@ -179,6 +235,46 @@ class TestIndentedCodeIsValidated(unittest.TestCase):
         Treating it as code would make ordinary nested prose uncompressible."""
         doc = "# Doc\n\n- a bullet\n    - nested prose that should stay compressible\n"
         self.assertEqual(extract_code_blocks(doc), [])
+
+
+class TestCrossTypeBlockOrderIsValidated(unittest.TestCase):
+    """extract_code_blocks used to return all fenced blocks (in doc order)
+    followed by all indented blocks (in doc order), so a fenced block and an
+    indented block swapping RELATIVE position produced the same concatenated
+    list on both sides of the diff. validate_code_blocks compares this list
+    positionally, so the swap passed silently even though the invariant it
+    checks (code block order preserved) was violated."""
+
+    ORIG = "Intro.\n\n```python\nprint('hi')\n```\n\nMiddle.\n\n    kubectl delete pod --all -n prod\n\nEnd.\n"
+    # Same two blocks, unchanged content, but the indented block now comes
+    # BEFORE the fenced block instead of after it.
+    SWAPPED = "Intro.\n\n    kubectl delete pod --all -n prod\n\nMiddle.\n\n```python\nprint('hi')\n```\n\nEnd.\n"
+
+    def test_extraction_reflects_document_order(self):
+        self.assertEqual(
+            extract_code_blocks(self.ORIG),
+            ["```python\nprint('hi')\n```", "    kubectl delete pod --all -n prod"],
+        )
+        self.assertEqual(
+            extract_code_blocks(self.SWAPPED),
+            ["    kubectl delete pod --all -n prod", "```python\nprint('hi')\n```"],
+        )
+
+    def test_swapped_block_order_fails_validation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            o, c = Path(tmp) / "o.md", Path(tmp) / "c.md"
+            o.write_text(self.ORIG, encoding="utf-8")
+            c.write_text(self.SWAPPED, encoding="utf-8")
+            result = validate(o, c)
+            self.assertFalse(result.is_valid, "a swapped block order must not pass")
+
+    def test_identical_document_still_passes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            o, c = Path(tmp) / "o.md", Path(tmp) / "c.md"
+            o.write_text(self.ORIG, encoding="utf-8")
+            c.write_text(self.ORIG, encoding="utf-8")
+            result = validate(o, c)
+            self.assertTrue(result.is_valid, result.errors)
 
 
 class TestPreservationPromisesAreErrors(unittest.TestCase):

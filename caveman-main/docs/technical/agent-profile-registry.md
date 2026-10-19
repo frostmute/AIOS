@@ -7,7 +7,7 @@ most agents, adding one is a **data change** (one JSON file here) and the CLI's 
 scale** (`injection_completeness`), because several agents genuinely need code:
 
 - **declarative** — the profile's `injection` block alone routes it (claude's default env, gemini,
-  aider, opencode). A true data-only add.
+  aider, opencode, qwen). A true data-only add.
 - **builder-assisted** — the profile is the base, but the CLI augments it in code: an
   `overlayBuilders.<id>` config-overlay builder (openclaw), or an auth/bedrock short-circuit
   (`applyClaudeBedrockWrap` for claude, `applyHermesAuthEnv` for hermes).
@@ -23,7 +23,7 @@ children inherit; each agent reads only its own subset, and the profile's inject
 top.
 
 ## Layout
-- [`../../agents/profiles/*.json`](../../agents/profiles/) — one profile per agent (`claude`, `codex`, `gemini`, `aider`, `opencode`, `hermes`, `openclaw`).
+- [`../../agents/profiles/*.json`](../../agents/profiles/) — one profile per agent (`claude`, `codex`, `gemini`, `aider`, `kilo`, `qwen`, `opencode`, `hermes`, `openclaw`, `pi`).
 - `../../agents/profiles/schema.json` — profile contract (JSON Schema, draft-07).
 - `../../agents/reserved-verbs.json` — command tokens no profile id or binary name may shadow;
   compiled into the CLI and tested against dispatcher reality.
@@ -40,7 +40,8 @@ top.
   reclassifies a working binary **newer** than the pin as `drift` (not `broken`) — used by the
   non-blocking @latest lane.
 - `../../agents/drift-report.mjs` — turns a `probe --allow-newer --json` result into one GitHub issue per
-  drifted agent (idempotent; opens or updates). Runs only in the non-blocking CI lane.
+  drifted or broken (@latest fails the probe) agent (idempotent; opens or updates). Runs only in the
+  non-blocking CI lane.
 - `../../.github/workflows/agent-conformance.yml` — daily/manual real-engine compression contract for
   all profiles plus one clean **pinned** upstream-binary probe per profile, and a separate
   **non-blocking `@latest` drift-report** lane that files drift issues.
@@ -48,7 +49,8 @@ top.
 `tested_agent_version` is evidence, not compatibility theater. Doctor compares
 installed version, downgrades unknown/newer/older hosts to safe inactive subsets,
 and reports binary-present-but-unlaunchable separately. Claude 2.1.226 is current
-locally grounded pin; other pins remain unchanged until equivalent proof exists.
+locally grounded pin. Qwen Code 0.22.3 has pinned real-CLI local and managed
+OpenAI-compatible route proof; other pins remain unchanged until equivalent proof exists.
 
 ## How a profile points an agent at the gateway
 `injection.method` is one of:
@@ -58,10 +60,14 @@ locally grounded pin; other pins remain unchanged until equivalent proof exists.
   safe path such as `/openai/v1`; secret keys cannot.
 - `config-env-content` — render a mode-selected inline JSON config (`config_content.local` for
   BYOK `caveman start`; `config_content.managed` when `CAVE_GATEWAY_URL` is off-loopback) and set
-  it as one env var. This is how **opencode** is wrapped (`OPENCODE_CONFIG_CONTENT`) without ever
-  touching the user's `opencode.json`. An agent's own `{env:VAR}` tokens are left untouched.
-- `config-file` — merge a mode-selected config overlay into a temp copy of the agent's own
-  config file on disk (how **openclaw** is wrapped, without mutating the user's real config).
+  it as one env var. This is how **opencode** (`OPENCODE_CONFIG_CONTENT`) and **Kilo Code**
+  (`KILO_CONFIG_CONTENT`) are wrapped without touching user config. An agent's own `{env:VAR}`
+  tokens are left untouched.
+- `config-file` — merge a mode-selected config overlay into a temporary file and point the agent
+  at it through the declared environment variable. **OpenClaw** uses a builder-assisted overlay.
+  **Qwen Code** is declarative: `QWEN_CODE_SYSTEM_SETTINGS_PATH` selects an explicit source first,
+  otherwise the CLI reads Qwen's macOS/Linux/Windows enterprise platform default, deep-merges the
+  route, and preserves the source policy, sibling providers, and `~/.qwen/settings.json`.
 
 ## How a profile auto-shrinks command output (`command_hook`, optional)
 `command_hook` declares how `caveman wrap`/`caveman hooks` route the agent's noisy
@@ -73,11 +79,20 @@ Three honest tiers — never claim a rewrite an agent can't do:
   (opencode/hermes/openclaw) deterministically reroutes the command before it runs.
   Claude + Gemini share one `installSettingsHook` (same settings.json shape, different
   event/matcher); every hard-rewrite method routes the command through `caveman shrink-hook`.
+  **`codex-pretooluse` is declared but inert** (#1037): Codex matches a saved approval
+  against the command text, so rewriting it re-prompts the user for a command they had
+  already allowed, and the rewritten command leads with the resolved caveman/node path
+  that no `prefix_rule` can cover. `shrinkHook` therefore declines every Codex tool
+  event and `hooks install codex` installs nothing. Retiring the method outright is
+  still open: the same `command_hook` entry carries codex's directives
+  instructions-file, and `nativeHooksDocument` would need to migrate the entry
+  `caveman enable codex` already wrote into existing installs.
 - `instruction-note` (+ `file`) — **soft model-nudge**: append a delimited "prefer
   `caveman shrink`" note to a file the agent auto-reads. Best-effort, idempotent,
   install→uninstall is a byte-exact round-trip. Retained only for hosts without a
-  current hard hook surface. Codex now uses its native `PreToolUse` hook in
-  `~/.codex/hooks.json` and supports `updatedInput` when allowing the tool.
+  current hard hook surface. (Codex was moved off this tier to its native
+  `PreToolUse` hook; see the `codex-pretooluse` note above for why that hook no
+  longer rewrites anything.)
 - **absent** — **manual-only**: no installable surface (e.g. Aider); `hooks` just prints
   the `caveman shrink -- <cmd>` guidance.
 

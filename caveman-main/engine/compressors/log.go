@@ -11,11 +11,36 @@ import (
 
 var (
 	// Lines worth keeping: errors, failures, warnings, stack-trace frames.
-	importantLineRe = regexp.MustCompile(`(?i)(\b(ERROR|FATAL|PANIC|EXCEPTION|TRACEBACK|FAIL|FAILED|FAILURE|WARN|WARNING)\b|^\s+at\s|^\s+File "|\.go:\d+|^\s+--->|caused by)`)
+	importantLineRe = regexp.MustCompile(`(?i)(\b(ERROR|FATAL|PANIC|EXCEPTION|TRACEBACK|FAIL|FAILED|FAILURE|WARN|WARNING|CRIT|CRITICAL|ALERT|EMERG|EMERGENCY)\b|^\s+at\s|^\s+File "|\.go:\d+|^\s+--->|caused by)`)
 	// A run of dropped lines is collapsed into this marker, which is itself
 	// kept on later passes so the compressor stays idempotent.
 	logMarkerRe = regexp.MustCompile(`lines elided \(caveman\)`)
 )
+
+// Keep the canonical regexp's word boundaries and Unicode case folding. Most
+// plain log lines contain none of its required literals; avoid trying every
+// regexp alternative at every byte of those lines. Non-ASCII and possible
+// stack-frame prefixes go directly to the original matcher.
+func importantLogLine(line []byte) bool {
+	if len(line) == 0 {
+		return false
+	}
+	if line[0] <= ' ' {
+		return importantLineRe.Match(line)
+	}
+	for _, b := range line {
+		if b >= utf8.RuneSelf {
+			return importantLineRe.Match(line)
+		}
+	}
+	lower := bytes.ToLower(line)
+	for _, literal := range []string{"error", "fatal", "panic", "exception", "traceback", "fail", "warn", "crit", "alert", "emerg", ".go:", "caused by"} {
+		if bytes.Contains(lower, []byte(literal)) {
+			return importantLineRe.Match(line)
+		}
+	}
+	return false
+}
 
 // logMarker renders the elision marker for a run of dropped lines. summary is
 // the class-invariant description of exactly those lines (see invariants.go); it
@@ -77,7 +102,7 @@ func (c *logCompressor) compress(input []byte, query string) ([]byte, bool) {
 			keep[i] = true
 			continue
 		}
-		if importantLineRe.Match(ln) || logMarkerRe.Match(ln) || bytes.HasPrefix(ln, []byte(elisionNotePrefix)) {
+		if importantLogLine(ln) || logMarkerRe.Match(ln) || bytes.HasPrefix(ln, []byte(elisionNotePrefix)) {
 			keep[i] = true
 		}
 	}

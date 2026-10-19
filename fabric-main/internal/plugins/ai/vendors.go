@@ -25,19 +25,26 @@ type VendorsManager struct {
 	Vendors       []Vendor
 	VendorsByName map[string]Vendor
 	Models        *VendorsModels
+	modelsMu      sync.Mutex
 }
 
 // AddVendors registers one or more vendors with the manager.
 // Vendors are stored with lowercase keys to enable case-insensitive lookup.
+// Membership changes invalidate the model catalog.
 func (o *VendorsManager) AddVendors(vendors ...Vendor) {
+	o.modelsMu.Lock()
+	defer o.modelsMu.Unlock()
 	for _, vendor := range vendors {
 		name := strings.ToLower(vendor.GetName())
 		o.VendorsByName[name] = vendor
 		o.Vendors = append(o.Vendors, vendor)
 	}
+	o.Models = nil
 }
 
 func (o *VendorsManager) Clear() {
+	o.modelsMu.Lock()
+	defer o.modelsMu.Unlock()
 	o.VendorsByName = map[string]Vendor{}
 	o.Vendors = []Vendor{}
 	o.Models = nil
@@ -50,6 +57,10 @@ func (o *VendorsManager) SetupFillEnvFileContent(envFileContent *bytes.Buffer) {
 }
 
 func (o *VendorsManager) GetModels() (ret *VendorsModels, err error) {
+	// Many goroutines can call GetModels, for example from the REST server.
+	// The lock makes sure that only one call reads the models.
+	o.modelsMu.Lock()
+	defer o.modelsMu.Unlock()
 	if o.Models == nil {
 		err = o.readModels()
 	}
@@ -92,13 +103,11 @@ func (o *VendorsManager) readModels() (err error) {
 		go o.fetchVendorModels(ctx, &wg, vendor, resultsChan)
 	}
 
-	// Wait for all goroutines to finish
 	go func() {
 		wg.Wait()
 		close(resultsChan)
 	}()
 
-	// Collect results
 	for result := range resultsChan {
 		if result.err != nil {
 			fmt.Println(result.vendorName, result.err)
@@ -120,10 +129,8 @@ func (o *VendorsManager) fetchVendorModels(
 	models, err := vendor.ListModels(ctx)
 	select {
 	case <-ctx.Done():
-		// Context canceled, don't send the result
 		return
 	case resultsChan <- modelResult{vendorName: vendor.GetName(), models: models, err: err}:
-		// Result sent
 	}
 }
 

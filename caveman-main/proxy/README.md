@@ -7,16 +7,32 @@ the original bytes are forwarded unchanged. Standalone records truthful per-requ
 spend to `~/.caveman/caveman.db` and only ever labels savings `inferred` — never
 `verified`.
 
-Source and binaries ship under BSL 1.1. This runtime is source-available, not
-OSI Open Source before Change Date. First-party self-hosted production is
-permitted; third-party hosted, managed, or embedded use requires commercial
-license. See `LICENSE` and `../LICENSING.md`.
+Source and binaries ship under Apache-2.0. See `LICENSE` and `../LICENSING.md`.
 
 ```bash
 go build ./proxy/...                 # build
 ANTHROPIC_API_KEY=… caveman-proxy    # serve on 127.0.0.1:8787
 caveman-proxy stats                  # print the local spend summary as JSON
 ```
+
+## Shared / VPC deployment
+
+The same binary runs as one shared service for a team. `CAVEMAN_AUTH_TOKEN` is
+the gate: set it and a non-loopback listen address is accepted, and every request
+must then carry the token in `x-cave-api-key` or `Authorization: Bearer`. The
+proxy consumes that header before resolving the provider credential, so the
+shared token is never forwarded upstream. Without the token a non-loopback listen
+address is still refused. Provider keys live on the server; Bedrock can use the
+task/pod/instance role instead.
+
+```bash
+docker run -d -p 8787:8787 -v caveman-data:/data \
+  -e CAVEMAN_AUTH_TOKEN="$(openssl rand -hex 32)" -e ANTHROPIC_API_KEY=… \
+  ghcr.io/juliusbrussee/caveman-proxy:bin-v1.1.7
+```
+
+See `../docs/technical/deploy.md` for Compose, ECS, Kubernetes, Cloud Run, and
+Fly.io recipes.
 
 Bedrock Runtime is first-party in standalone mode; no raw endpoint is required.
 Use either the low-friction bearer key or a complete IAM pair:
@@ -36,6 +52,22 @@ then a complete IAM pair. A partial pair fails closed. Region precedence is
 Inbound Bedrock `x-api-key` and bearer credentials are stamped as Bedrock API
 keys before auth-mode classification. A Claude Code user agent therefore cannot
 relabel paid Bedrock traffic as subscription traffic.
+
+## Codex on a ChatGPT login (`/chatgpt`)
+
+`caveman enable codex` (or `caveman codex`) points Codex at `/chatgpt` and starts
+this proxy with recovery confirmed whenever the caveman MCP server is installed.
+A `caveman-proxy` you start yourself compresses `/chatgpt` traffic only when it
+can prove the agent can fetch elided content back. Either start it with
+`CAVEMAN_MODE=compress CAVEMAN_RECOVERY=mcp` (and keep the caveman MCP server
+registered in Codex), or let each request carry Caveman's
+`mcp__caveman__caveman_retrieve` tool, top-level or in Codex's `additional_tools`
+input item. Without either, every request forwards unchanged.
+
+zstd request bodies (Codex's default) are decoded, compressed and re-encoded.
+A body that does not decode, or does not shrink, goes out as the exact original
+bytes. When a request could have been compressed and was not, the
+`chatgpt_proxy` log line says why in `skip_reason`.
 
 Driven by the `caveman` CLI: `caveman start` launches this binary, `caveman wrap
 <agent>` points the agent's provider-specific base URL at it. A Bedrock Claude

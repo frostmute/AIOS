@@ -123,7 +123,22 @@ func requestToolMatches(body []byte, match func(string) bool) bool {
 		return false
 	}
 	tools, _ := root["tools"].([]any)
-	return toolNameInList(tools, match)
+	if toolNameInList(tools, match) {
+		return true
+	}
+	// Codex (Desktop and newer CLI builds) declares its catalog in an input[]
+	// item {"type":"additional_tools","tools":[...]} instead of top-level tools.
+	input, _ := root["input"].([]any)
+	for _, item := range input {
+		im, _ := item.(map[string]any)
+		if im == nil || im["type"] != "additional_tools" {
+			continue
+		}
+		if tools, _ := im["tools"].([]any); toolNameInList(tools, match) {
+			return true
+		}
+	}
+	return false
 }
 
 type gatewayJSONSpan struct {
@@ -359,6 +374,18 @@ func toolNameInList(tools []any, match func(string) bool) bool {
 				return true
 			}
 		}
+		// Responses namespace {"type":"namespace","name":"mcp__caveman","tools":[...]}:
+		// the model-visible name of a member is the namespace joined to its name, so
+		// only that joined spelling may match — never the bare member name.
+		if tm["type"] == "namespace" {
+			ns, _ := tm["name"].(string)
+			members, _ := tm["tools"].([]any)
+			if ns != "" && toolNameInList(members, func(n string) bool {
+				return n != "" && match(strings.TrimSuffix(ns, "__")+"__"+n)
+			}) {
+				return true
+			}
+		}
 		declarations, _ := tm["functionDeclarations"].([]any)
 		for _, declaration := range declarations {
 			declarationMap, _ := declaration.(map[string]any)
@@ -493,12 +520,12 @@ func retrieveArgs(argBytes []byte) (handle, query string) {
 }
 
 func appendRetrieveResult(provider, routePath string, reqBody, respBody []byte, callID, recovered string) ([]byte, bool) {
-	var req map[string]any
-	if json.Unmarshal(reqBody, &req) != nil {
+	req, ok := decodeForRewrite(reqBody)
+	if !ok {
 		return nil, false
 	}
-	var resp map[string]any
-	if json.Unmarshal(respBody, &resp) != nil {
+	resp, ok := decodeForRewrite(respBody)
+	if !ok {
 		return nil, false
 	}
 	if providerUsesGeminiTools(provider, routePath) {
@@ -613,6 +640,7 @@ func addUsage(a, b providers.UsageObservation) providers.UsageObservation {
 		a.Malformed = true
 	}
 	a.Malformed = a.Malformed || b.Malformed
+	a.ProviderError = a.ProviderError || b.ProviderError
 	a.CacheObserved = a.CacheObserved || b.CacheObserved
 	a.CacheStatus = aggregateCacheStatus(a)
 	if a.PricingUnsupportedReason == "" {
@@ -658,9 +686,49 @@ func bufferedBody(resp *http.Response, body []byte) *http.Response {
 	return resp
 }
 
-func stripRetrieveCall(provider, routePath string, respBody []byte) ([]byte, bool) {
+// decodeForRewrite decodes a document that will be re-marshalled after being
+// mutated, so it must not lose information the sender put in it.
+//
+// UseNumber is load-bearing. encoding/json decodes an untyped JSON number into
+// float64, which represents integers exactly only up to 2^53, so a plain
+// decode-mutate-remarshal silently rounds every larger integer literal
+// ANYWHERE in the document — not just near the field being changed. In this
+// file that reaches a sibling tool_use's arguments on the way back to the
+// agent, and the whole conversation history on the way back upstream.
+// json.Number keeps the literal and marshals it back verbatim. Same defect as
+// #1057 on the Bedrock adapter.
+//
+// Only string/slice/map assertions are made on these documents, so carrying
+// json.Number through costs the callers nothing.
+// The trailing-input check is not optional. json.Unmarshal rejects a document
+// with trailing bytes after the top-level value; a Decoder stops at the end of
+// the first value and does not care what follows. Without the check a body with
+// trailing bytes would go from "not JSON we understand, hand it back untouched"
+// to "rewrite it, and drop the trailing bytes", losing caller bytes.
+//
+// It has to be a second Decode returning io.EOF, not decoder.More(). More()
+// answers "is there another element in the current array or object", which is
+// not the same question: it returns FALSE for a trailing closing delimiter, so
+// `{...}]` and `{...}}` would still be accepted and silently lose that byte.
+// Requiring io.EOF matches json.Unmarshal's acceptance set exactly — trailing
+// whitespace passes, any trailing byte at all does not.
+func decodeForRewrite(body []byte) (map[string]any, bool) {
+	decoder := json.NewDecoder(bytes.NewReader(body))
+	decoder.UseNumber()
 	var root map[string]any
-	if json.Unmarshal(respBody, &root) != nil {
+	if decoder.Decode(&root) != nil {
+		return nil, false
+	}
+	var trailing json.RawMessage
+	if decoder.Decode(&trailing) != io.EOF {
+		return nil, false
+	}
+	return root, true
+}
+
+func stripRetrieveCall(provider, routePath string, respBody []byte) ([]byte, bool) {
+	root, ok := decodeForRewrite(respBody)
+	if !ok {
 		return respBody, false
 	}
 	changed := false

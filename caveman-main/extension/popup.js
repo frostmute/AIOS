@@ -43,19 +43,20 @@ buildFlame(document.getElementById("flame"));
 
 // ── settings wiring ──────────────────────────────────────────────────────
 const HINTS = {
-  lite: "No filler or hedging. Keeps full sentences.",
-  full: "Classic caveman. Drops articles, fragments OK.",
-  ultra: "Max compression. No invented abbreviations or causal arrows.",
+  caveman: "Answer first, fluff gone, every technical fact kept.",
+  ultracave: "Grammar stripped. Fragments, each fact once.",
+  megacave: "Classical Chinese (文言文). Code stays verbatim.",
 };
 
 function load() {
-  store.get({ enabled: true, level: "full", sites: {} }, (s) => {
+  store.get({ enabled: true, level: "caveman", sites: {} }, (s) => {
+    const mode = CavemanDirective.normMode(s.level);
     document.getElementById("master").checked = s.enabled;
     document.body.dataset.enabled = s.enabled ? "1" : "0";
     document.querySelectorAll('input[name="level"]').forEach((r) => {
-      r.checked = r.value === s.level;
+      r.checked = r.value === mode;
     });
-    document.getElementById("levelHint").textContent = HINTS[s.level] || "";
+    document.getElementById("levelHint").textContent = HINTS[mode] || "";
     document.querySelectorAll("input[data-site]").forEach((c) => {
       c.checked = s.sites[c.dataset.site] !== false; // default on
     });
@@ -87,14 +88,17 @@ document.querySelectorAll("input[data-site]").forEach((c) => {
 
 document.getElementById("brand").addEventListener("click", (e) => e.preventDefault());
 
-// Review CTA → the Chrome Web Store reviews tab for THIS install. The id is read
-// from chrome.runtime at runtime (in a published install it is the store id), so
-// there is no hardcoded extension id to drift; the file:// preview shim falls
-// back to the store home.
+// Firefox add-on IDs are UUIDs, not Chrome Web Store listing IDs. Until an
+// authoritative AMO review URL is available, hide that CTA in Firefox builds.
 (() => {
   const link = document.getElementById("review");
   if (!link) return;
   const id = typeof chrome !== "undefined" && chrome.runtime && chrome.runtime.id;
+  const manifest = typeof chrome !== "undefined" && chrome.runtime?.getManifest?.();
+  if (manifest?.browser_specific_settings?.gecko || (id && /^\{.*\}$/.test(id))) {
+    link.remove();
+    return;
+  }
   link.href = id ? `https://chromewebstore.google.com/detail/${id}/reviews` : "https://chromewebstore.google.com/";
 })();
 

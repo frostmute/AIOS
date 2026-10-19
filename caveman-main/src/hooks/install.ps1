@@ -1,5 +1,5 @@
 # caveman — one-command hook installer for Claude Code (Windows PowerShell)
-# Installs: SessionStart hook (auto-load rules) + UserPromptSubmit hook (mode tracking)
+# Installs: SessionStart hook (auto-load rules) + SubagentStart hook (subagent mode) + UserPromptSubmit hook (mode tracking) + SessionEnd stats recorder
 # Usage: powershell -ExecutionPolicy Bypass -File src\hooks\install.ps1
 #   or:  powershell -ExecutionPolicy Bypass -File src\hooks\install.ps1 -Force
 #   or (remote, no -Force support via pipe):
@@ -28,6 +28,40 @@ $HookFiles = @("package.json", "caveman-config.js", "caveman-parse.js", "caveman
 
 # Resolve source — works from repo clone or remote
 $ScriptDir = if ($PSScriptRoot) { $PSScriptRoot } else { $null }
+
+# Use the unified JSONC parser when running from a clone. Standalone copies
+# refuse unreadable settings before copying hooks or replacing existing files.
+$SettingsHelper = ""
+if ($ScriptDir) {
+    $candidate = Join-Path $ScriptDir "../../installer/lib/settings.js"
+    if (Test-Path -LiteralPath $candidate) { $SettingsHelper = $candidate }
+}
+$env:CAVEMAN_SETTINGS = $Settings
+$env:CAVEMAN_HOOKS_DIR = $HooksDir
+$env:CAVEMAN_SETTINGS_HELPER = $SettingsHelper
+@'
+const fs = require('fs');
+try {
+  const manifest = process.env.CAVEMAN_HOOKS_DIR + '/package.json';
+  if (fs.existsSync(manifest)) {
+    const value = JSON.parse(fs.readFileSync(manifest, 'utf8'));
+    if (!value || typeof value !== 'object' || Array.isArray(value) || (value.type !== undefined && value.type !== 'commonjs')) {
+      throw new Error('existing hooks/package.json is incompatible with CommonJS hooks');
+    }
+  }
+  const file = process.env.CAVEMAN_SETTINGS;
+  if (fs.existsSync(file)) {
+    const helper = process.env.CAVEMAN_SETTINGS_HELPER;
+    const value = helper ? require(helper).readSettings(file) : JSON.parse(fs.readFileSync(file, 'utf8'));
+    if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('settings.json must be a readable object');
+  }
+} catch (error) {
+  console.error('Cannot install standalone hooks: ' + error.message);
+  console.error('Nothing was changed. For JSONC settings, use installer/install.js from a clone.');
+  process.exit(1);
+}
+'@ | node --input-type=commonjs
+if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
 # Check if already installed (unless -Force). Older installs only had two hook
 # files, so require the full current set plus the hook registrations before we
@@ -67,7 +101,9 @@ if (-not $Force) {
                 return $false
             }
             $HooksWired = (& $hasCavemanHook "SessionStart" "caveman-activate.js") `
-                -and (& $hasCavemanHook "UserPromptSubmit" "caveman-mode-tracker.js")
+                -and (& $hasCavemanHook "SubagentStart" "caveman-activate.js") `
+                -and (& $hasCavemanHook "UserPromptSubmit" "caveman-mode-tracker.js") `
+                -and (& $hasCavemanHook "SessionEnd" "caveman-stats.js")
             $HasStatusLine = $null -ne $settingsObj.statusLine
         } catch {
             $HooksWired = $false
@@ -98,6 +134,10 @@ if (-not (Test-Path $HooksDir)) {
 # 2. Copy or download hook files
 foreach ($hook in $HookFiles) {
     $dest = Join-Path $HooksDir $hook
+    if ($hook -eq "package.json" -and (Test-Path -LiteralPath $dest)) {
+        Write-Host "  Preserved existing: $dest"
+        continue
+    }
     $localSource = if ($ScriptDir) { Join-Path $ScriptDir $hook } else { $null }
 
     if ($localSource -and (Test-Path $localSource)) {
@@ -116,7 +156,7 @@ if (-not (Test-Path $Settings)) {
 # Back up existing settings.json before touching it. Back up ONCE: without the
 # Test-Path guard a -Force reinstall overwrites the only pre-caveman copy with
 # the already-merged file, destroying the user's recovery path. Same guard as
-# bin/install.js.
+# installer/install.js.
 if (-not (Test-Path "$Settings.bak")) {
     Copy-Item $Settings "$Settings.bak"
 }
@@ -132,7 +172,11 @@ const fs = require('fs');
 const settingsPath = process.env.CAVEMAN_SETTINGS;
 const hooksDir = process.env.CAVEMAN_HOOKS_DIR;
 const managedStatusLinePath = hooksDir + '/caveman-statusline.ps1';
-const settings = JSON.parse(fs.readFileSync(settingsPath, 'utf8'));
+const shared = process.env.CAVEMAN_SETTINGS_HELPER ? require(process.env.CAVEMAN_SETTINGS_HELPER) : null;
+const meta = {};
+const settings = shared ? shared.readSettings(settingsPath, meta) : JSON.parse(fs.readFileSync(settingsPath, 'utf8'));
+if (!settings || typeof settings !== 'object' || Array.isArray(settings)) throw new Error('settings.json must be a readable object');
+if (meta.jsonc) console.log('  Comments are preserved in ' + settingsPath + '.bak; updated settings use JSON.');
 if (!settings.hooks) settings.hooks = {};
 
 // SessionStart
@@ -154,6 +198,22 @@ if (!hasStart) {
   });
 }
 
+// SubagentStart — hand subagents this session's active mode (#621)
+if (!settings.hooks.SubagentStart) settings.hooks.SubagentStart = [];
+const hasSubagent = settings.hooks.SubagentStart.some(e =>
+  e.hooks && e.hooks.some(h => h.command && h.command.includes('caveman-activate.js'))
+);
+if (!hasSubagent) {
+  settings.hooks.SubagentStart.push({
+    hooks: [{
+      type: 'command',
+      command: 'node "' + hooksDir + '/caveman-activate.js" --subagent',
+      timeout: 30,
+      statusMessage: 'Loading caveman mode for subagent...'
+    }]
+  });
+}
+
 // UserPromptSubmit
 if (!settings.hooks.UserPromptSubmit) settings.hooks.UserPromptSubmit = [];
 const hasPrompt = settings.hooks.UserPromptSubmit.some(e =>
@@ -166,6 +226,22 @@ if (!hasPrompt) {
       command: 'node "' + hooksDir + '/caveman-mode-tracker.js"',
       timeout: 30,
       statusMessage: 'Tracking caveman mode...'
+    }]
+  });
+}
+
+// SessionEnd
+if (!settings.hooks.SessionEnd) settings.hooks.SessionEnd = [];
+const hasEnd = settings.hooks.SessionEnd.some(e =>
+  e.hooks && e.hooks.some(h => h.command && h.command.includes('caveman-stats.js'))
+);
+if (!hasEnd) {
+  settings.hooks.SessionEnd.push({
+    hooks: [{
+      type: 'command',
+      command: 'node "' + hooksDir + '/caveman-stats.js" --record',
+      timeout: 5,
+      statusMessage: 'Recording caveman stats...'
     }]
   });
 }
@@ -189,7 +265,8 @@ if (!settings.statusLine) {
   }
 }
 
-fs.writeFileSync(settingsPath, JSON.stringify(settings, null, 2) + '\n');
+if (shared) shared.writeSettings(settingsPath, settings);
+else fs.writeFileSync(settingsPath, JSON.stringify(settings, null, 2) + '\n');
 console.log('  Hooks wired in settings.json');
 '@
 
@@ -197,8 +274,13 @@ $tmpScript = Join-Path $env:TEMP "caveman-install-$([System.Diagnostics.Process]
 try {
     [System.IO.File]::WriteAllText($tmpScript, $nodeScript, [System.Text.Encoding]::UTF8)
     node $tmpScript
+    $MergeExitCode = $LASTEXITCODE
 } finally {
     if (Test-Path $tmpScript) { Remove-Item $tmpScript -Force }
+}
+if ($MergeExitCode -ne 0) {
+    Write-Host "Hook settings could not be updated; installation did not complete." -ForegroundColor Red
+    exit $MergeExitCode
 }
 
 Write-Host ""
@@ -206,6 +288,8 @@ Write-Host "Done! Restart Claude Code to activate." -ForegroundColor Green
 Write-Host ""
 Write-Host "What's installed:"
 Write-Host "  - SessionStart hook: auto-loads caveman rules every session"
+Write-Host "  - SubagentStart hook: subagents inherit the session's active mode"
 Write-Host "  - Mode tracker hook: updates statusline badge when you switch modes"
-Write-Host "    (/caveman lite, /caveman ultra, /caveman-commit, etc.)"
-Write-Host "  - Statusline badge: shows [CAVEMAN] or [CAVEMAN:ULTRA] etc."
+Write-Host "    (/caveman, /ultracave, /megacave, /caveman-commit, etc.)"
+Write-Host "  - SessionEnd hook: records lifetime stats silently"
+Write-Host "  - Statusline badge: shows [CAVEMAN], [ULTRACAVE] or [MEGACAVE]"

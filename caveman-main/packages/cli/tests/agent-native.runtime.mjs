@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { isolatedCliEnv, runCli, runCliWithApi } from "./_cli.mjs";
 
@@ -133,9 +133,8 @@ test("setup --agent-native codex installs complete native integration plus MCP a
     const hooksPath = join(isolated.home, ".codex", "hooks.json");
     const canonicalHooks = readFileSync(hooksPath, "utf8");
     const changedHooks = JSON.parse(canonicalHooks);
-    const changedEntry = changedHooks.hooks.PreToolUse.find((entry) => JSON.stringify(entry).includes("shrink-hook"));
-    assert.ok(changedEntry, "fixture missing owned shrink-hook entry");
-    changedEntry.changed_after_setup = true;
+    // Codex gets no shrink-hook entry any more; an older install's, changed since.
+    changedHooks.hooks.PreToolUse.push({ hooks: [{ type: "command", command: "caveman shrink-hook" }], changed_after_setup: true });
     writeFileSync(hooksPath, JSON.stringify(changedHooks, null, 2) + "\n");
     const refusedNativeDriftRemoval = await runCli(["setup", "--agent-native", "codex", "--remove"], { env: isolated.env });
     assert.notEqual(refusedNativeDriftRemoval.code, 0);
@@ -222,7 +221,10 @@ test("setup --agent-native preserves an unjournaled Claude cloud MCP registratio
     writeFileSync(claude, "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo 'claude 1.0.0'; fi\n", { mode: 0o755 });
     writeFileSync(mcp, "#!/bin/sh\nif [ \"$1\" = \"version\" ]; then printf '%s\\n' '{\"version\":\"1.0.0\",\"capabilities\":[\"mcp_recovery\"]}'; fi\n", { mode: 0o755 });
     writeFileSync(proxy, "#!/bin/sh\nif [ \"$1\" = \"version\" ]; then printf '%s\\n' '{\"version\":\"1.0.0\",\"capabilities\":[\"native_runtime_v1\",\"native_hook_bridge_v1\",\"typed_ccr\"]}'; fi\n", { mode: 0o755 });
-    Object.assign(isolated.env, { PATH: `${bin}:${isolated.env.PATH}`, CAVEMAN_MCP_BIN: mcp, CAVEMAN_PROXY_BIN: proxy });
+    // Each run probes these stubs several times (preflight, enable, postflight)
+    // under a 2-3s cap; a loaded box can miss it, and a missed claude probe
+    // fails the postflight as "unavailable" and rolls the setup back.
+    Object.assign(isolated.env, { PATH: `${bin}:${isolated.env.PATH}`, CAVEMAN_MCP_BIN: mcp, CAVEMAN_PROXY_BIN: proxy, CAVE_BINARY_PROBE_TIMEOUT_MS: "10000" });
     const configPath = join(isolated.home, ".claude.json");
     const before = JSON.stringify({ mcpServers: { "caveman-cloud": { command: "user-command", args: ["keep"] } }, theme: "keep" }, null, 2) + "\n";
     writeFileSync(configPath, before);
@@ -350,4 +352,70 @@ test("experiment CLI rejects lifecycle mutation verbs without HTTP", async () =>
   assert.equal(out.code, 2);
   assert.equal(out.requests.length, 0);
   assert.match(out.stderr, /experiments list\|show <id>\|results <id>/);
+});
+
+// #1134: `setup --agent-native <agent> --remove` is the undo for the bundle that
+// `setup --agent-native <agent>` installs — and for nothing else. A user who
+// reached the same config.toml through `caveman codex` or `caveman enable codex`
+// has no bundle journal, so this path warns and stops. The warning was a dead end:
+// it named a journal the user has never heard of and no command to run instead,
+// which is how "it is also very difficult to uninstall" gets reported as a bug.
+// It must name the verb that actually undoes the install they did.
+for (const agent of ["codex", "claude"]) {
+  test(`setup --agent-native ${agent} --remove points at disable when there is no bundle`, async () => {
+    const isolated = isolatedCliEnv();
+    try {
+      const out = await runCli(["setup", "--agent-native", agent, "--remove"], { env: isolated.env });
+      assert.equal(out.code, 0, out.stderr);
+      assert.match(out.stderr, /no agent-native bundle journal found/, "the accurate part stays");
+      assert.match(
+        out.stderr,
+        new RegExp(`caveman disable ${agent}`),
+        "it must name the command that removes an enable/wrap install",
+      );
+    } finally {
+      isolated.cleanup();
+    }
+  });
+}
+
+test("a rolled-back setup and a bundle removal record no opt-out; disable does", { skip: process.platform === "win32" || process.getuid?.() === 0 }, async () => {
+  const isolated = isolatedCliEnv();
+  try {
+    const bin = join(isolated.home, "bin");
+    mkdirSync(bin, { recursive: true });
+    const mcp = join(bin, "caveman-mcp");
+    const proxy = join(bin, "caveman-proxy");
+    writeFileSync(join(bin, "codex"), "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo 'codex 1.0.0'; fi\n", { mode: 0o755 });
+    writeFileSync(mcp, "#!/bin/sh\nif [ \"$1\" = \"version\" ]; then printf '%s\\n' '{\"version\":\"1.0.0\",\"capabilities\":[\"mcp_recovery\"]}'; fi\n", { mode: 0o755 });
+    writeFileSync(proxy, "#!/bin/sh\nif [ \"$1\" = \"version\" ]; then printf '%s\\n' '{\"version\":\"1.0.0\",\"capabilities\":[\"native_runtime_v1\",\"native_hook_bridge_v1\",\"typed_ccr\"]}'; fi\n", { mode: 0o755 });
+    Object.assign(isolated.env, { PATH: `${bin}:${isolated.env.PATH}`, CAVEMAN_MCP_BIN: mcp, CAVEMAN_PROXY_BIN: proxy });
+    const optOut = () => {
+      const path = join(isolated.home, "cloud.json");
+      return existsSync(path) ? JSON.parse(readFileSync(path, "utf8")).nativeOptOut : undefined;
+    };
+    // A skills directory nothing can be created in: the native install
+    // succeeds, the skill write fails, and setup rolls its own install back.
+    const blocker = join(isolated.home, ".codex", "skills");
+    mkdirSync(blocker, { recursive: true });
+    chmodSync(blocker, 0o555);
+    const failed = await runCli(["setup", "--agent-native", "codex"], { env: isolated.env });
+    assert.notEqual(failed.code, 0);
+    assert.match(failed.stderr, /agent-native setup failed: .*changes rolled back/);
+    assert.equal(existsSync(join(isolated.home, "integrations", "codex.json")), false, "the native install was rolled back");
+    assert.equal(optOut(), undefined, "a rollback is not the user's choice");
+
+    chmodSync(blocker, 0o755);
+    assert.equal((await runCli(["setup", "--agent-native", "codex"], { env: isolated.env })).code, 0);
+    const removed = await runCli(["setup", "--agent-native", "codex", "--remove"], { env: isolated.env });
+    assert.equal(removed.code, 0, removed.stderr);
+    assert.equal(existsSync(join(isolated.home, "integrations", "codex.json")), false);
+    assert.equal(optOut(), undefined, "removing the bundle is not `caveman disable`");
+
+    assert.equal((await runCli(["enable", "codex"], { env: isolated.env })).code, 0);
+    assert.equal((await runCli(["disable", "codex"], { env: isolated.env })).code, 0);
+    assert.deepEqual(optOut(), ["codex"]);
+  } finally {
+    isolated.cleanup();
+  }
 });

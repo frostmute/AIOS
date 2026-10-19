@@ -7,12 +7,12 @@ import (
 	"math"
 	"net/url"
 	"os"
-	"path/filepath"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/JuliusBrussee/caveman/shared/platform/cost"
+	providercatalog "github.com/JuliusBrussee/caveman/shared/provider-catalog"
 	"gopkg.in/yaml.v3"
 )
 
@@ -53,6 +53,9 @@ var (
 
 const contextWindowTokensCapability = "context_window_tokens"
 
+// effortLevelsCapability is read by EffortLevels only; it never prices.
+const effortLevelsCapability = "effort_levels"
+
 // ContextWindowTokens returns the provider-declared context window from an
 // exact provider+model catalog match. Regional rows must agree; missing,
 // malformed, non-positive, or conflicting capability values fail closed.
@@ -73,6 +76,37 @@ func ContextWindowTokens(provider, model string) (int, bool) {
 		found = true
 	}
 	return window, found
+}
+
+// EffortLevels returns the reasoning efforts an exact provider+model catalog
+// match accepts (capabilities.effort_levels). Rows that disagree, or a missing
+// or malformed list, report false.
+func EffortLevels(provider, model string) ([]string, bool) {
+	once.Do(load)
+	provider = canonicalCapabilityProvider(provider)
+	var levels []string
+	for _, entry := range entries {
+		if entry.Provider != provider || entry.Model != model {
+			continue
+		}
+		raw, ok := entry.Capabilities[effortLevelsCapability].([]any)
+		if !ok || len(raw) == 0 {
+			return nil, false
+		}
+		row := make([]string, 0, len(raw))
+		for _, value := range raw {
+			level, ok := value.(string)
+			if !ok {
+				return nil, false
+			}
+			row = append(row, level)
+		}
+		if levels != nil && strings.Join(levels, ",") != strings.Join(row, ",") {
+			return nil, false
+		}
+		levels = row
+	}
+	return levels, levels != nil
 }
 
 func canonicalCapabilityProvider(provider string) string {
@@ -278,22 +312,27 @@ func catalogVersion(verifiedAt string) string {
 	return "unknown"
 }
 
+// load decodes the catalog embedded at build time. CAVE_CATALOG_PATH swaps in an
+// on-disk file and is authoritative: a bad override fails closed (empty catalog)
+// instead of silently falling back to the embedded one. There is deliberately no
+// working-directory search — that made every window and price depend on where the
+// binary was launched, and left binaries outside the repo with no catalog at all.
 func load() {
-	for _, path := range catalogCandidates() {
-		raw, err := os.ReadFile(path)
-		if err != nil {
-			loadErr = err
-			continue
-		}
-		decoded, err := DecodeAndValidate(raw)
-		if err == nil {
-			entries = decoded
-			loadErr = nil
+	raw, path := providercatalog.Current, "embedded"
+	if p := os.Getenv("CAVE_CATALOG_PATH"); p != "" {
+		path = p
+		var err error
+		if raw, err = os.ReadFile(p); err != nil {
+			loadErr, entries = err, []Entry{}
 			return
 		}
-		loadErr = fmt.Errorf("catalog %s: %w", path, err)
 	}
-	entries = []Entry{}
+	decoded, err := DecodeAndValidate(raw)
+	if err != nil {
+		loadErr, entries = fmt.Errorf("catalog %s: %w", path, err), []Entry{}
+		return
+	}
+	entries, loadErr = decoded, nil
 }
 
 // DecodeAndValidate strictly parses a catalog. Unknown YAML fields, duplicate
@@ -360,39 +399,4 @@ func DecodeAndValidate(raw []byte) ([]Entry, error) {
 		seen[key] = struct{}{}
 	}
 	return decoded, nil
-}
-
-// catalogCandidates lists the paths to try, in order: an explicit env override,
-// the deploy-image and CWD-relative locations, then a walk up from the working
-// directory so the catalog resolves when binaries or tests run from subdirs.
-// Both repo layouts are tried: the monorepo keeps the catalog under public/,
-// the published caveman repo has it at the top level.
-func catalogCandidates() []string {
-	rels := []string{
-		"public/shared/provider-catalog/catalog/current.yaml",
-		"shared/provider-catalog/catalog/current.yaml",
-	}
-	candidates := []string{}
-	if p := os.Getenv("CAVE_CATALOG_PATH"); p != "" {
-		// Explicit override is authoritative. A bad override fails closed instead
-		// of silently falling back to a different on-disk catalog.
-		return []string{p}
-	}
-	for _, rel := range rels {
-		candidates = append(candidates, rel, "/app/"+rel)
-	}
-	if wd, err := os.Getwd(); err == nil {
-		dir := wd
-		for i := 0; i < 8; i++ {
-			for _, rel := range rels {
-				candidates = append(candidates, filepath.Join(dir, rel))
-			}
-			parent := filepath.Dir(dir)
-			if parent == dir {
-				break
-			}
-			dir = parent
-		}
-	}
-	return candidates
 }

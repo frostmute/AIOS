@@ -5,10 +5,12 @@
 // resolve the same handles.
 
 import { type ChildProcess, execFile, spawn } from "node:child_process";
+import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
 import { homedir } from "node:os";
 import { delimiter, join } from "node:path";
 import { type PortableInvocation, portableInvocation } from "./portable-command.ts";
+import { MAX_MESSAGE_BYTES, MAX_TOOL_OUTPUT_BYTES, normalizeRecoveryHandle } from "./protocol.ts";
 
 const PROBE_TIMEOUT_MS = 2000;
 const CALL_TIMEOUT_MS = 30_000;
@@ -18,6 +20,7 @@ const CALL_TIMEOUT_MS = 30_000;
 // in this package is 750ms–6s; a timed-out handshake degrades the session to
 // "no recovery available" instead.
 const INIT_TIMEOUT_MS = 2000;
+const VERIFY_TIMEOUT_MS = 2000;
 
 export type RetrieveResult = { text: string; isError: boolean };
 
@@ -39,6 +42,7 @@ export class RecoveryClient {
   private child: ChildProcess | undefined;
   private initialized = false;
   private probed: boolean | undefined;
+  private verificationSupported = false;
   private ensuring: Promise<boolean> | undefined;
   private nextId = 1;
   private pending = new Map<number, Pending>();
@@ -91,6 +95,30 @@ export class RecoveryClient {
     }
   }
 
+  // A silent pre-publication proof must not count as delivery to the model.
+  // Old companions ignore unknown arguments, so capability proof is mandatory
+  // before sending verify_only through the same long-lived recovery child.
+  async verify(handle: string, originalText: string): Promise<boolean> {
+    const normalized = normalizeRecoveryHandle(handle);
+    const bytes = Buffer.byteLength(originalText, "utf8");
+    if (!normalized || bytes > MAX_TOOL_OUTPUT_BYTES) return false;
+    try {
+      if (!(await this.ensure()) || !this.verificationSupported) return false;
+      const result = await this.call("tools/call", {
+        name: "caveman_retrieve",
+        arguments: { recovery_handle: normalized, verify_only: true },
+      }, undefined, VERIFY_TIMEOUT_MS) as { content?: Array<{ type?: string; text?: string }>; isError?: boolean };
+      if (result.isError || !Array.isArray(result.content) || result.content.length !== 1) return false;
+      const block = result.content[0];
+      if (block?.type !== "text" || typeof block.text !== "string" || Buffer.byteLength(block.text, "utf8") > MAX_MESSAGE_BYTES) return false;
+      const proof = JSON.parse(block.text);
+      return proof?.recovery_handle === normalized && proof.byte_length === bytes &&
+        proof.sha256 === createHash("sha256").update(originalText, "utf8").digest("hex");
+    } catch {
+      return false;
+    }
+  }
+
   dispose(): void {
     this.disposed = true;
     const child = this.child;
@@ -125,10 +153,11 @@ export class RecoveryClient {
     return new Promise((resolve) => {
       const portable = this.invocation(["version", "--json"]);
       if (!portable) return resolve(false);
-      execFile(portable.command, portable.args, { timeout: PROBE_TIMEOUT_MS, encoding: "utf8" }, (error, stdout) => {
+      execFile(portable.command, portable.args, { timeout: PROBE_TIMEOUT_MS, encoding: "utf8", windowsHide: true }, (error, stdout) => {
         if (error) return resolve(false);
         try {
           const parsed = JSON.parse(stdout);
+          this.verificationSupported = Array.isArray(parsed?.capabilities) && parsed.capabilities.includes("recovery_verification");
           resolve(Array.isArray(parsed?.capabilities) && parsed.capabilities.includes("mcp_recovery"));
         } catch {
           resolve(false);
@@ -142,7 +171,9 @@ export class RecoveryClient {
     try {
       const portable = this.invocation([]);
       if (!portable) return false;
-      child = spawn(portable.command, portable.args, { stdio: ["pipe", "pipe", "ignore"] });
+      // windowsHide: pi runs this extension in-process, so a host without a
+      // console of its own would give this child a console window (#1214).
+      child = spawn(portable.command, portable.args, { stdio: ["pipe", "pipe", "ignore"], windowsHide: true });
     } catch {
       return false;
     }
@@ -164,7 +195,7 @@ export class RecoveryClient {
       await this.call("initialize", {
         protocolVersion: "2024-11-05",
         capabilities: {},
-        clientInfo: { name: "caveman-pi-extension", version: "0.1.0" },
+        clientInfo: { name: "caveman-pi-extension", version: "0.3.1" },
       }, undefined, INIT_TIMEOUT_MS);
       this.notify("notifications/initialized");
       if (this.disposed) { this.onChildGone(child); this.stop(child); return false; }

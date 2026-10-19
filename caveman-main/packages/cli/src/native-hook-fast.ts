@@ -3,10 +3,13 @@ import { appendFileSync, chmodSync, lstatSync, mkdirSync, readFileSync, realpath
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { connect as netConnect } from "node:net";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { fileURLToPath } from "node:url";
 
 import { hardenedGitArgs, hardenedGitEnv } from "./git-safe.js";
+import { nativePipePath } from "./native-pipe.js";
+import { confirmLearnNudge, maybeSpawnAutopilot } from "./learn-autopilot.js";
+import { cloudConfigPath } from "./modules/config-home.js";
 
 type NativeAgent = "claude" | "codex" | "hermes" | "gemini" | "opencode" | "pi";
 type NativePolicyMode = "record" | "safe" | "max";
@@ -43,13 +46,19 @@ function caveHome(): string {
 
 // localGatewayEndpoint resolves the gateway target and returns its host/port
 // only when it is a loopback proxy — the only case where a dead port means
-// "the local proxy needs restarting". Managed gateways (CAVE_GATEWAY_URL /
-// persisted gatewayUrl off-loopback) return undefined and never pay a
-// per-prompt delegate spawn. Default mirrors the full CLI's PROXY_ADDR.
+// "the local proxy needs restarting". Managed gateways (CAVE_GATEWAY_URL, or a
+// gatewayUrl chosen at login, managedGateway) off-loopback return undefined and
+// never pay a per-prompt delegate spawn. Signing in alone keeps the local
+// proxy. Default mirrors the full CLI's PROXY_ADDR, as does `localPort`.
 function localGatewayEndpoint(): { host: string; port: number } | undefined {
   let gw: unknown = process.env.CAVE_GATEWAY_URL;
   if (typeof gw !== "string" || !gw.trim()) {
-    try { gw = object(JSON.parse(readFileSync(join(homedir(), ".caveman-cloud", "config.json"), "utf8"))).gatewayUrl; } catch { /* local default */ }
+    try {
+      const config = object(JSON.parse(readFileSync(cloudConfigPath(), "utf8")));
+      if (config.managedGateway === true) gw = config.gatewayUrl;
+      // The port setup moved the runtime to (index.ts gatewayUrlFromConfigFile).
+      else if (typeof config.localPort === "number" && Number.isInteger(config.localPort) && config.localPort >= 1024 && config.localPort <= 65535) gw = `http://127.0.0.1:${config.localPort}`;
+    } catch { /* local default */ }
   }
   if (typeof gw !== "string" || !gw.trim()) return { host: "127.0.0.1", port: 8787 };
   try {
@@ -82,7 +91,7 @@ function configuredMode(): "compress" | "record" | "pixel" {
   const explicit = process.env.CAVEMAN_WRAP_MODE;
   if (explicit !== undefined) return explicit === "compress" || explicit === "pixel" || explicit === "record" ? explicit : "record";
   try {
-    const config = object(JSON.parse(readFileSync(join(homedir(), ".caveman-cloud", "config.json"), "utf8")));
+    const config = object(JSON.parse(readFileSync(cloudConfigPath(), "utf8")));
     const legacy = object(config.wrap).mode;
     const current = object(config.think).mode;
     const value = current ?? legacy;
@@ -102,7 +111,7 @@ function configuredCore(): boolean {
   };
   let configured = true;
   try {
-    const config = object(JSON.parse(readFileSync(join(homedir(), ".caveman-cloud", "config.json"), "utf8")));
+    const config = object(JSON.parse(readFileSync(cloudConfigPath(), "utf8")));
     configured = parse(object(config.think).core) ?? true;
   } catch { /* default above */ }
   const env = process.env.CAVEMAN_CORE;
@@ -253,12 +262,18 @@ function gitDir(cwd: string): string | undefined {
   }
 }
 
+// Go's nativehook.repositoryStatusBudget, for the same reason: 100ms emptied the
+// state under ordinary load. Only search/test/build tool events pay it, never
+// alongside the prompt-time delegate; with the runtime call's 250ms it stays far
+// inside the host's 30s hook timeout.
+const REPOSITORY_STATUS_TIMEOUT_MS = 500;
+
 function repositoryState(cwd: string | undefined): string | undefined {
   if (!cwd) return undefined;
   try {
     const status = execFileSync("git", hardenedGitArgs(cwd, "status", "--porcelain=v1", "-z", "--branch", "--untracked-files=all"), {
       env: hardenedGitEnv(),
-      timeout: 100, maxBuffer: 8 * 1024 * 1024, stdio: ["ignore", "pipe", "ignore"],
+      timeout: REPOSITORY_STATUS_TIMEOUT_MS, maxBuffer: 8 * 1024 * 1024, stdio: ["ignore", "pipe", "ignore"],
     });
     const directory = gitDir(cwd);
     if (!directory) return undefined;
@@ -357,7 +372,7 @@ function callRuntime(value: Record<string, unknown>): Promise<RuntimeResponse | 
     let bytes = 0;
     const chunks: Buffer[] = [];
     const endpoint = process.platform === "win32"
-      ? `\\\\.\\pipe\\caveman-native-${createHash("sha256").update(resolve(caveHome()).replaceAll("/", "\\").toLowerCase()).digest("hex").slice(0, 16)}`
+      ? nativePipePath(caveHome())
       : join(caveHome(), "run", "native.sock");
     const socket = netConnect({ path: endpoint });
     const finish = (response?: RuntimeResponse) => {
@@ -403,9 +418,13 @@ const DELEGATE_TIMEOUT_MS = 3000;
 
 function delegateToFullCLI(raw: Buffer, agent: NativeAgent): boolean {
   const cli = join(dirname(fileURLToPath(import.meta.url)), "index.js");
-  const result = spawnSync(process.execPath, [cli, "native-hook", agent], { input: raw, maxBuffer: 3 * 1024 * 1024, env: process.env, timeout: DELEGATE_TIMEOUT_MS });
+  const nudgeToken = randomUUID();
+  const result = spawnSync(process.execPath, [cli, "native-hook", agent], { input: raw, maxBuffer: 3 * 1024 * 1024, env: { ...process.env, CAVEMAN_LEARN_NUDGE_TOKEN: nudgeToken }, timeout: DELEGATE_TIMEOUT_MS });
   if (!result.error && result.status === 0) {
-    if (result.stdout?.length) process.stdout.write(result.stdout);
+    // The child left any learn nudge in-flight; it is announced only once it
+    // actually reaches the host, so a delegate timeout lets it re-show once.
+    const nudged = result.stdout?.includes('"systemMessage"') === true;
+    if (result.stdout?.length) process.stdout.write(result.stdout, () => { if (nudged) confirmLearnNudge(nudgeToken); });
     if (result.stderr?.length) process.stderr.write(result.stderr);
     return true;
   }
@@ -427,6 +446,7 @@ async function main(): Promise<void> {
   const rawName = bounded(event.hook_event_name ?? event.event_name ?? event.event ?? process.argv[4]);
   const mapped = agent === "gemini" && rawName ? ({ BeforeAgent: "UserPromptSubmit", BeforeTool: "PreToolUse", AfterTool: "PostToolUse", BeforeModel: "ModelBefore", AfterModel: "ModelAfter", PreCompress: "PreCompact", AfterAgent: "Stop" } as Record<string, string>)[rawName] ?? rawName : rawName;
   const eventName = mapped && EVENTS.has(mapped) ? mapped : "Unknown";
+  if (eventName === "SessionEnd") maybeSpawnAutopilot();
   if (eventName === "SessionStart" || eventName === "PostCompact") {
     delegateToFullCLI(raw, agent);
     return;
@@ -450,8 +470,8 @@ async function main(): Promise<void> {
   if (!response) {
     // A dead loopback gateway PORT at prompt time is the SessionStart revive
     // signal arriving mid-session: native routing still points this session's
-    // next request at the local proxy, but a wrap-owned proxy idle-exits after
-    // its wrap dies and a plain session has no other way to restart it — the
+    // next request at the local proxy. Crashes or older proxies that idle-exit
+    // can leave a plain session without a way to restart it — the
     // turn hard-fails with ConnectionRefused. Delegate this one event to the
     // full CLI, which revives the proxy exactly like SessionStart (and records
     // the event itself). The port probe — not the dead runtime socket — is the

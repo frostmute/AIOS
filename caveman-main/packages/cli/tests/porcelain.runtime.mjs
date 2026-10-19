@@ -1,12 +1,22 @@
 import { test } from "node:test";
 import assert from "node:assert";
+import { readFileSync } from "node:fs";
 import { createServer } from "node:http";
 import { isolatedCliEnv, runCli } from "./_cli.mjs";
+
+const AGENTS = JSON.parse(
+  readFileSync(new URL("../../../agents/agents.json", import.meta.url), "utf8"),
+).agents;
+const visibleAgents = AGENTS.slice(0, 8).map((agent) => agent.id);
+const hiddenAgentCount = AGENTS.length - visibleAgents.length;
+const renderedAgentList = `${visibleAgents.join(" | ")}${
+  hiddenAgentCount > 0 ? ` | +${hiddenAgentCount} more — caveman run` : ""
+}`;
 
 const HELP = `caveman
 
 run
-  caveman <agent>        run an agent on the layer  (aider | claude | codex | gemini | hermes | openclaw | opencode | pi)
+  caveman <agent>        run an agent on the layer  (${renderedAgentList})
   caveman run -- <cmd>   run anything else on the layer
 
 understand
@@ -14,7 +24,7 @@ understand
   caveman status         what the layer did today
 
 connect
-  caveman login          free · 1 seat · no card
+  caveman login          free account
 
 more
   caveman tools          local, no account   ·  caveman help tools
@@ -109,8 +119,8 @@ test("help learn explains summary, detail, and agent implementation paths", asyn
   try {
     const out = await runCli(["help", "learn"], { env: isolated.env });
     assert.equal(out.code, 0, out.stderr);
-    assert.match(out.stdout, /default\s+interactive setup score \+ grouped top moves/);
-    assert.match(out.stdout, /--plain\s+compact text; no animation or keyboard menu/);
+    assert.match(out.stdout, /default\s+interactive Setup Score \+ top findings/);
+    assert.match(out.stdout, /--plain\s+short text; no animation or keyboard menu/);
     assert.match(out.stdout, /--all\s+every finding/);
     assert.match(out.stdout, /implement\s+open Claude Code or Codex/);
   } finally {
@@ -165,6 +175,10 @@ test("namespaced telemetry emits resolved command and subcommand", async () => {
   try {
     const out = await runCli(["sdk", "snippet"], { env: isolated.env, prefix: "tools" });
     assert.equal(out.code, 0, out.stderr);
+    // The POST comes from a detached child after the CLI exits.
+    for (let waited = 0; posts.length < 1 && waited < 5000; waited += 50) {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
     assert.equal(posts.length, 1);
     assert.equal(posts[0][0].command, "sdk");
     assert.equal(posts[0][0].subcommand, "snippet");

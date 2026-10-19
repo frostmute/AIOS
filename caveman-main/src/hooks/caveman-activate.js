@@ -6,6 +6,9 @@
 //   2. Emits caveman ruleset as hidden SessionStart context
 //   3. Detects missing statusline config and emits setup nudge
 //
+// With --subagent it is the SubagentStart hook instead (#621): hands each new
+// subagent this session's active skill. Read-only — see runSubagent().
+//
 // Mode state is per session, not per machine — see the "Per-session mode state"
 // block in caveman-config.js. The payload's session_id scopes every read and
 // write below; an absent or malformed one degrades to the old machine-wide flag.
@@ -69,10 +72,23 @@ function requireSibling(name, isUsable) {
 // Hand-copy of caveman-config.js VALID_MODES, used only when that module is
 // unavailable. tests/test_hook_missing_sibling.js asserts the two stay equal.
 const FALLBACK_VALID_MODES = [
-  'off', 'lite', 'full', 'ultra',
-  'wenyan-lite', 'wenyan', 'wenyan-full', 'wenyan-ultra',
+  'off', 'caveman', 'ultracave', 'megacave',
   'commit', 'review', 'compress'
 ];
+const FALLBACK_DEFAULT_MODES = [...FALLBACK_VALID_MODES, 'manual'];
+// Hand-copy of caveman-config.js LEGACY_MODES: a config file or env var still
+// naming a pre-three-skill level must resolve the same way when degraded.
+const FALLBACK_LEGACY_MODES = {
+  lite: 'caveman', full: 'caveman', ultra: 'ultracave',
+  wenyan: 'megacave', 'wenyan-lite': 'megacave',
+  'wenyan-full': 'megacave', 'wenyan-ultra': 'megacave',
+};
+function fallbackCanonicalDefault(raw) {
+  if (typeof raw !== 'string') return null;
+  const m = raw.toLowerCase();
+  if (FALLBACK_DEFAULT_MODES.includes(m)) return m;
+  return Object.prototype.hasOwnProperty.call(FALLBACK_LEGACY_MODES, m) ? FALLBACK_LEGACY_MODES[m] : null;
+}
 
 // Minimal stand-in for caveman-config.getDefaultMode. It must mirror the real
 // resolution order rather than read only the env var: a degrade that ignores a
@@ -83,10 +99,10 @@ const FALLBACK_VALID_MODES = [
 function fallbackReadMode(file) {
   try {
     if (!fs.lstatSync(file).isFile()) return null;
-    const mode = JSON.parse(fs.readFileSync(file, 'utf8')).defaultMode;
-    if (typeof mode === 'string' && FALLBACK_VALID_MODES.includes(mode.toLowerCase())) {
-      return mode.toLowerCase();
-    }
+    // A BOM or UTF-16LE (PowerShell 5.1) must not drop an opt-out here either.
+    const buf = fs.readFileSync(file);
+    const text = buf[0] === 0xff && buf[1] === 0xfe ? buf.toString('utf16le', 2) : buf.toString('utf8').replace(/^\uFEFF/, '');
+    return fallbackCanonicalDefault(JSON.parse(text).defaultMode);
   } catch (e) { /* absent, unreadable, or malformed → next source */ }
   return null;
 }
@@ -103,8 +119,8 @@ function fallbackGetDefaultMode(startDir) {
   // 1. Environment variable. No .trim() — the real resolver does not trim, and
   //    a degraded path that accepts " ultra" where the intact one rejects it is
   //    drift in a whitelist.
-  const envMode = process.env.CAVEMAN_DEFAULT_MODE;
-  if (envMode && FALLBACK_VALID_MODES.includes(envMode.toLowerCase())) return envMode.toLowerCase();
+  const envMode = fallbackCanonicalDefault(process.env.CAVEMAN_DEFAULT_MODE);
+  if (envMode) return envMode;
   // 2. Repo-local config, walking up. Bounded at 64 like findRepoConfigPath.
   try {
     let dir = path.resolve(startDir || process.cwd());
@@ -118,8 +134,11 @@ function fallbackGetDefaultMode(startDir) {
       dir = parent;
     }
   } catch (e) { /* fall through to user config */ }
-  // 3. User config, then 4. the built-in default.
-  return fallbackReadMode(fallbackUserConfigPath()) || 'full';
+  // 3. User config (Windows: %APPDATA%, then ~/.config), then 4. the built-in default.
+  return fallbackReadMode(fallbackUserConfigPath())
+    || (process.platform === 'win32' && !process.env.XDG_CONFIG_HOME
+      && fallbackReadMode(path.join(os.homedir(), '.config', 'caveman', 'config.json')))
+    || 'caveman';
 }
 
 // Degraded stubs keep the rest of this hook working when the config module is
@@ -171,13 +190,28 @@ const writeSessionMode = cfg.writeSessionMode || ((dir, sid, modeOrNull) => {
   else safeWriteFlag(flagPath, modeOrNull);
 });
 const legacyFlagPath = cfg.legacyFlagPath || (() => flagPath);
+const resolveActiveMode = cfg.resolveActiveMode || (() => {
+  const m = readFlag(flagPath);
+  return (!m || m === 'off') ? null : m;
+});
+// settings.json is JSONC: comments and trailing commas are legal there. An
+// older config module without the tolerant reader degrades to strict JSON.
+const parseSettingsFile = cfg.parseConfigFile || ((p) => JSON.parse(fs.readFileSync(p, 'utf8')));
+
+const SUBAGENT = process.argv.includes('--subagent');
+
+// Modes that have their own independent skill files — not caveman prose modes.
+const INDEPENDENT_MODES = new Set(['commit', 'review', 'compress']);
 
 // Apply per-agent model overrides from env vars before emitting rules.
 // Best-effort: any error is swallowed so SessionStart is never blocked.
-try {
-  const { applyOverrides, resolvePluginRoot } = require('./cavecrew-model-overrides');
-  applyOverrides(resolvePluginRoot(__dirname));
-} catch (e) {}
+// SessionStart only: the subagent path writes nothing.
+if (!SUBAGENT) {
+  try {
+    const { applyOverrides, resolvePluginRoot } = require('./cavecrew-model-overrides');
+    applyOverrides(resolvePluginRoot(__dirname));
+  } catch (e) {}
+}
 
 // SessionStart re-fires mid-conversation (resume, /clear, context compaction),
 // not just at true session start. Re-firing must not clobber a mode the user
@@ -202,7 +236,7 @@ try {
 // A watchdog covers the case where the payload never completes at all: activate
 // well inside the budget instead of forfeiting the session. It must NOT assume
 // `startup` — that is the one source that resets the mode, so a slow payload on
-// a `compact`/`resume` event would silently drop a user's mid-session `ultra`
+// a `compact`/`resume` event would silently drop a user's mid-session `ultracave`
 // back to the default (#691 through the timeout door). An unknown source
 // preserves a valid existing flag. The deadline sits well below the host's 5s
 // budget but far enough above a cold Windows/AV start to be reached rarely.
@@ -219,10 +253,21 @@ const PAYLOAD_WATCHDOG_MS = 2000;
 // and the watchdog's 'unknown') reads instead of re-deriving.
 const RESET_SOURCES = new Set(['startup', 'clear']);
 
+// The configured default, except that headless `claude -p` and Agent SDK
+// sessions (#377) start under the manual policy: they are often tool probes
+// that parse the reply. Interactive entrypoints (cli, claude-vscode,
+// claude-desktop, ...) never match; CAVEMAN_DEFAULT_MODE in env opts back in.
+function startMode(sessionCwd) {
+  const mode = getDefaultMode(sessionCwd);
+  if (mode !== 'off' && !process.env.CAVEMAN_DEFAULT_MODE
+      && /^sdk-/.test(process.env.CLAUDE_CODE_ENTRYPOINT || '')) return 'manual';
+  return mode;
+}
+
 function activate(payload, timedOut) {
   // Unknown, not startup: we never saw the payload, so we cannot claim to know
   // what kind of session event this was — and 'unknown' must not reset, or a
-  // slow payload on a compact would drop a mid-session ultra (#691 through the
+  // slow payload on a compact would drop a mid-session ultracave (#691 through the
   // timeout door) and re-arm a session the user turned off.
   let source = timedOut ? 'unknown' : 'startup';
   // The session's cwd, which is not necessarily this hook process's cwd. The
@@ -233,15 +278,34 @@ function activate(payload, timedOut) {
   // Scopes every mode read/write to this window. null when absent or malformed,
   // in which case the config helpers fall back to the legacy machine-wide flag.
   let sessionId = null;
+  let agentType = '';
   try {
     if (payload) {
       const data = JSON.parse(payload);
       if (data && typeof data.source === 'string') source = data.source;
       if (data && typeof data.cwd === 'string') sessionCwd = data.cwd;
+      if (data && typeof data.agent_type === 'string') agentType = data.agent_type;
       if (data) sessionId = validateSessionId(data.session_id);
     }
   } catch (e) { /* no/bad stdin → treat as startup */ }
-  run(source, sessionCwd, sessionId);
+  if (SUBAGENT) runSubagent(sessionCwd, sessionId, agentType);
+  else run(source, sessionCwd, sessionId);
+}
+
+// SubagentStart (#621): SessionStart context reaches only the parent thread,
+// so each subagent gets this session's active skill here. READ-ONLY — no mode
+// write, no mode log, no GC, no statusline nudge — and silent whenever this
+// session is off, so "stop caveman" never leaks into subagents (#672).
+function runSubagent(sessionCwd, sessionId, agentType) {
+  const mode = resolveActiveMode(claudeDir, sessionId);
+  if (!mode || INDEPENDENT_MODES.has(mode)) return;
+  // cavecrew agents carry their own ultracave voice.
+  if (/(^|:)cavecrew-/.test(agentType)) return;
+  // #634 repo opt-out, same gate as the tracker's per-turn reinforcement.
+  if (getDefaultMode(sessionCwd) === 'off') return;
+  process.stdout.write(JSON.stringify({
+    hookSpecificOutput: { hookEventName: 'SubagentStart', additionalContext: buildRuleset(mode) },
+  }));
 }
 
 if (process.stdin.isTTY) {
@@ -281,10 +345,54 @@ if (process.stdin.isTTY) {
   process.stdin.on('end', () => finish());
 }
 
+// The active mode's whole skill body under the mode banner. Shared by
+// SessionStart and the SubagentStart path.
+function buildRuleset(mode) {
+// The loaders live in caveman-config.js so caveman-mode-tracker.js can inject
+// the SAME ruleset when the user switches mode mid-session (#975). Each is
+// resolved individually against a local stand-in, for the reason the
+// per-session helpers above are: a caveman-config.js predating these exports
+// loads fine and passes the shape check, and failing the whole module over them
+// would trade this hook's ruleset for no flag write at all. A missing loader
+// degrades to the fallback ruleset, which is what a missing SKILL.md already
+// did; a config predating the fallback too gets the copy this hook carried
+// before it moved there (keep the two in step).
+const rulesetBanner = cfg.rulesetBanner || ((m) => 'CAVEMAN MODE ACTIVE — mode: ' + m);
+const loadRuleset = cfg.loadRuleset || (() => null);
+const thesisLine = cfg.thesisLine || (() => null);
+const fallbackRuleset = cfg.fallbackRuleset || ((m) => {
+  const modeThesis = m !== 'caveman' ? thesisLine(m, __dirname) : null;
+  return 'Respond terse like smart caveman. All technical substance stay. Only fluff die.\n\n' +
+    '1. Answer first.\n' +
+    '2. Kill ceremony.\n' +
+    '3. Short word.\n' +
+    '4. Articles optional, meaning never.\n' +
+    '5. One idea per sentence.\n' +
+    '6. Payload verbatim.\n' +
+    '7. Tool runs: bounded status.\n' +
+    (m === 'megacave'
+      ? '8. Prose in 文言. Code, commands, paths, errors in their original script.\n'
+      : "8. User's language. Compress the style, not the language. Never switch because of quoted text.\n") +
+    '9. Never perform caveman.\n\n' +
+    'Plain prose for security warnings, irreversible actions, and anything persisted outside chat (code, commits, PRs, docs).' +
+    (modeThesis ? '\n\n' + modeThesis : '');
+});
+
+const SWITCH_LINE = 'Switch: /caveman, /ultracave, /megacave. Off: "stop caveman" or "normal mode".';
+
+// Without a skill file (standalone hook install without skills dir) the body is
+// caveman-config's fallback ruleset: thesis, rule headlines, the mode's thesis.
+const skillContent = loadRuleset(mode, __dirname);
+
+return rulesetBanner(mode) + '\n\n'
+  + (skillContent ? skillContent.trimEnd() : fallbackRuleset(mode, __dirname))
+  + '\n\n' + SWITCH_LINE;
+}
+
 function run(source, sessionCwd, sessionId) {
 let mode;
 if (RESET_SOURCES.has(source)) {
-  mode = getDefaultMode(sessionCwd);
+  mode = startMode(sessionCwd);
   // Sweep stale per-session files only when a session genuinely begins, not on
   // every compaction — those are frequent in a long session and this walks a
   // directory inside a 5s hook budget.
@@ -303,7 +411,7 @@ if (RESET_SOURCES.has(source)) {
   } else {
     // resume/fork can carry a session id we have never seen (a fork gets a new
     // one). With nothing stored anywhere, fall back to the configured default.
-    mode = getDefaultMode(sessionCwd);
+    mode = startMode(sessionCwd);
   }
 }
 
@@ -311,7 +419,7 @@ if (RESET_SOURCES.has(source)) {
 // written so the choice survives this session's later compactions: that write
 // is what closes the "stop caveman → /compact re-arms caveman" hole, because
 // the next SessionStart finds a durable 'off' instead of an absent file.
-if (mode === 'off') {
+if (mode === 'off' || mode === 'manual') {
   recordModeChange(claudeDir, null, sessionId); // #601: timestamped transition log
   writeSessionMode(claudeDir, sessionId, null);
   process.stdout.write('OK');
@@ -322,142 +430,180 @@ if (mode === 'off') {
 recordModeChange(claudeDir, mode, sessionId); // #601
 writeSessionMode(claudeDir, sessionId, mode);
 
-// 2. Emit full caveman ruleset, filtered to the active intensity level.
-//    The old 2-sentence summary was too weak — models drifted back to verbose
-//    mid-conversation, especially after context compression pruned it away.
-//    Full rules with examples anchor behavior much more reliably.
+// 2. Emit the active mode's whole skill body. The old 2-sentence summary was
+//    too weak — models drifted back to verbose mid-conversation, especially
+//    after context compression pruned it away.
 //
-//    Reads SKILL.md at runtime so edits to the source of truth propagate
-//    automatically — no hardcoded duplication to go stale.
+//    Reads skills/<mode>/SKILL.md at runtime so edits to the source of truth
+//    propagate automatically — no hardcoded duplication to go stale.
 
-// Modes that have their own independent skill files — not caveman intensity levels.
-// For these, emit a short activation line; the skill itself handles behavior.
-const INDEPENDENT_MODES = new Set(['commit', 'review', 'compress']);
-
+// Independent modes get a short activation line; the skill handles behavior.
 if (INDEPENDENT_MODES.has(mode)) {
-  process.stdout.write('CAVEMAN MODE ACTIVE — level: ' + mode + '. Behavior defined by /caveman-' + mode + ' skill.');
+  process.stdout.write('CAVEMAN MODE ACTIVE — mode: ' + mode + '. Behavior defined by /caveman-' + mode + ' skill.');
   process.exit(0);
 }
 
-// Resolve the canonical label for wenyan alias
-const modeLabel = mode === 'wenyan' ? 'wenyan-full' : mode;
-
-// Read SKILL.md — the single source of truth for caveman behavior.
-// Candidate locations, tried in order (#587/#589 — the old single '..' path
-// resolved to <plugin_root>/src/skills/, which doesn't exist, so plugin
-// installs silently used the stale fallback ruleset):
-//   1. $CLAUDE_PLUGIN_ROOT/skills/caveman/SKILL.md — Claude Code sets
-//      CLAUDE_PLUGIN_ROOT when invoking plugin hooks; authoritative when present.
-//   2. ../../skills/caveman/SKILL.md — hook at <plugin_root>/src/hooks/
-//      (plugin.json layout) or a repo checkout.
-//   3. ../skills/caveman/SKILL.md — standalone install with hooks at
-//      $CLAUDE_CONFIG_DIR/hooks/ and the skill at $CLAUDE_CONFIG_DIR/skills/caveman/.
-// All misses fall through to the hardcoded fallback ruleset below.
-const skillCandidates = [];
-if (process.env.CLAUDE_PLUGIN_ROOT) {
-  skillCandidates.push(path.join(process.env.CLAUDE_PLUGIN_ROOT, 'skills', 'caveman', 'SKILL.md'));
-}
-skillCandidates.push(
-  path.join(__dirname, '..', '..', 'skills', 'caveman', 'SKILL.md'),
-  path.join(__dirname, '..', 'skills', 'caveman', 'SKILL.md')
-);
-
-let skillContent = '';
-for (const candidate of skillCandidates) {
-  try {
-    skillContent = fs.readFileSync(candidate, 'utf8');
-    break;
-  } catch (e) { /* try next candidate */ }
-}
-
-let output;
-
-if (skillContent) {
-  // Strip YAML frontmatter
-  const body = skillContent.replace(/^---[\s\S]*?---\s*/, '');
-
-  // Filter intensity table: keep header rows + only the active level's row
-  const filtered = body.split('\n').reduce((acc, line) => {
-    // Intensity table rows start with | **level** |
-    const tableRowMatch = line.match(/^\|\s*\*\*(\S+?)\*\*\s*\|/);
-    if (tableRowMatch) {
-      // Keep only the active level's row (and always keep header/separator)
-      if (tableRowMatch[1] === modeLabel) {
-        acc.push(line);
-      }
-      return acc;
-    }
-
-    // Example lines start with "- level:" — keep only lines matching active level
-    const exampleMatch = line.match(/^- (\S+?):\s/);
-    if (exampleMatch) {
-      if (exampleMatch[1] === modeLabel) {
-        acc.push(line);
-      }
-      return acc;
-    }
-
-    acc.push(line);
-    return acc;
-  }, []);
-
-  output = 'CAVEMAN MODE ACTIVE — level: ' + modeLabel + '\n\n' + filtered.join('\n');
-} else {
-  // Fallback when SKILL.md is not found (standalone hook install without skills dir).
-  // This is the minimum viable ruleset — better than nothing.
-  output =
-    'CAVEMAN MODE ACTIVE — level: ' + modeLabel + '\n\n' +
-    'Respond terse like smart caveman. All technical substance stay. Only fluff die.\n\n' +
-    '## Persistence\n\n' +
-    'Default style for this whole session, every response, until user say "stop caveman" or "normal mode". Keep terse on long sessions — no filler drift.\n\n' +
-    'Current level: **' + modeLabel + '**. Switch: `/caveman lite|full|ultra|wenyan-lite|wenyan-full|wenyan-ultra`.\n\n' +
-    '## Rules\n\n' +
-    'Drop: articles (a/an/the), filler (just/really/basically/actually/simply), pleasantries (sure/certainly/of course/happy to), hedging. ' +
-    'Fragments OK. Short synonyms (big not extensive, fix not "implement a solution for"). Technical terms exact. Code blocks unchanged. Errors quoted exact.\n\n' +
-    "Preserve user's dominant language. User write Portuguese → reply Portuguese caveman. Compress the style, not the language. Technical terms, code, API names, commands, error strings stay verbatim.\n\n" +
-    'Answer directly in this style. Skip "caveman mode on" tags or a "Caveman:" recap — redundant with the reply itself.\n\n' +
-    'Pattern: `[thing] [action] [reason]. [next step].`\n\n' +
-    'Not: "Sure! I\'d be happy to help you with that. The issue you\'re experiencing is likely caused by..."\n' +
-    'Yes: "Bug in auth middleware. Token expiry check use `<` not `<=`. Fix:"\n\n' +
-    '## Auto-Clarity\n\n' +
-    'Drop caveman for: security warnings, irreversible action confirmations, multi-step sequences where fragment order risks misread, user asks to clarify or repeats question. Resume caveman after clear part done.\n\n' +
-    '## Boundaries\n\n' +
-    'Code/commits/PRs: write normal. "stop caveman" or "normal mode": revert. Level persist until changed or session end.';
-}
+let output = buildRuleset(mode);
 
 // 3. Detect missing statusline config — nudge Claude to help set it up.
 // One-shot (#661): the nudge costs ~90 tokens per session, so a marker file
 // gates it to the first session only. Users who declined stop paying for it.
 const nudgeMarkerPath = path.join(claudeDir, '.caveman-nudge-shown');
+// A plugin install runs this hook from the VERSIONED plugin cache
+// (~/.claude/plugins/cache/caveman/caveman/<version>/src/hooks/), so a command
+// built from __dirname froze whichever version was installed when the nudge
+// fired. Claude Code prunes old cache versions; once the pinned directory goes,
+// `bash <missing path>` exits 127 and Claude Code hides the whole status bar
+// (#711) — and because the nudge is one-shot, the badge is never offered again
+// (#1147). Recommend a version-independent copy instead: the same
+// <claudeDir>/hooks/ path the standalone installer already owns.
+//
+// `.caveman-sessions` is the ownership marker: both statusline scripts read the
+// session store, and verify_repo.py pins that string in each of them. A file at
+// the stable path without it is the user's own script and is never touched.
+const STATUSLINE_MARKER = (cfg.SESSIONS_DIRNAME || '.caveman-sessions');
+
+// The stable copy to recommend, or null to keep the caller on __dirname. Copies
+// only when the destination is absent or is a caveman script that has drifted
+// from the running one — so a plugin update reaches the badge, and a foreign or
+// hand-edited script survives untouched.
+function stableStatuslinePath(scriptName) {
+  try {
+    const source = path.join(__dirname, scriptName);
+    const target = path.join(claudeDir, 'hooks', scriptName);
+    if (path.resolve(source) === path.resolve(target)) return target; // standalone install
+    const wanted = fs.readFileSync(source, 'utf8');
+    if (!wanted.includes(STATUSLINE_MARKER)) return null; // not a script we recognize
+    if (fs.existsSync(target)) {
+      const current = fs.readFileSync(target, 'utf8');
+      if (current === wanted) return target;
+      if (!current.includes(STATUSLINE_MARKER)) return null; // foreign — leave it alone
+    }
+    safeWriteFlag(target, wanted);
+    // safeWriteFlag fails silently by design, so confirm the bytes landed
+    // rather than recommending a path that may not exist.
+    return fs.readFileSync(target, 'utf8') === wanted ? target : null;
+  } catch (e) {
+    return null;
+  }
+}
+
+// The caveman statusline script paths `command` runs, or null when it names
+// none (the user's own statusline, left alone) or one the hook cannot resolve.
+function statuslineScripts(command) {
+  if (typeof command !== 'string') return null;
+  const found = [];
+  // Quoted first, and the quoted form is what both recommended commands use.
+  // A whitespace-delimited scan alone would truncate "C:\\Users\\Jane Doe\\..."
+  // at the space, call an existing script missing, and re-nudge every user
+  // whose home directory has a space in it.
+  const quoted = /"([^"]*caveman-statusline\.(?:sh|ps1))"|'([^']*caveman-statusline\.(?:sh|ps1))'/g;
+  let match;
+  while ((match = quoted.exec(command)) !== null) found.push(match[1] || match[2]);
+  if (found.length === 0) {
+    const bare = command.match(/[^"'\s]*caveman-statusline\.(?:sh|ps1)/g);
+    if (bare) found.push(...bare);
+  }
+  if (found.length === 0) return null;
+  // `~`, `$VAR` and backslash escapes are expanded by the shell at statusline
+  // time, not by existsSync: a hand-written "~/.claude/hooks/..." command works
+  // but reads as missing here, and a false "repair needed" nudge invites the
+  // model to rewrite the user's settings. Treat such a candidate as unknown.
+  // On Windows a backslash is a path separator, so only `~` and `$` are opaque.
+  // Only a LEADING `~` expands: one inside a path is literal, as in the Windows
+  // 8.3 short names (C:\Users\RUNNER~1\...) that %TEMP% and some homes use.
+  const opaque = (candidate) =>
+    /^~|\$/.test(candidate) || (process.platform !== 'win32' && candidate.includes('\\'));
+  return found.some(opaque) ? null : found;
+}
+
+// True when a configured caveman script still exists but is not the one shipped
+// beside this hook: a pre-3.1 copy pinned in a versioned plugin cache whitelists
+// only the old mode ids, so it renders nothing — not even for the default mode.
+// A script without the ownership marker is the user's own and never "outdated".
+function statuslineScriptOutdated(candidate) {
+  try {
+    const running = fs.readFileSync(path.join(__dirname, path.basename(candidate)), 'utf8');
+    const current = fs.readFileSync(candidate, 'utf8');
+    return current !== running && current.includes(STATUSLINE_MARKER);
+  } catch (e) {
+    return false; // missing on either side, or unreadable: not provably outdated
+  }
+}
+
 try {
+  const isWindows = process.platform === 'win32';
+  const scriptName = isWindows ? 'caveman-statusline.ps1' : 'caveman-statusline.sh';
+
   let hasStatusline = false;
+  let staleCommand = null;
+  let staleKind = null; // 'gone' | 'outdated'
   if (fs.existsSync(settingsPath)) {
-    const rawSettings = fs.readFileSync(settingsPath, 'utf8');
+    let configured;
     try {
-      hasStatusline = !!JSON.parse(rawSettings).statusLine;
+      configured = parseSettingsFile(settingsPath).statusLine;
+      hasStatusline = !!configured;
     } catch (e) {
-      // JSONC (comments / trailing commas) is legal in settings.json and the
-      // hooks dir has no JSONC parser. Fall back to a substring probe and err
+      // Unparseable even as JSONC. Fall back to a substring probe and err
       // toward NOT nudging: a spurious "set up your statusline" for a user who
-      // already has one is worse than a missing nudge.
-      hasStatusline = rawSettings.includes('"statusLine"');
+      // already has one is worse than a missing nudge. The command cannot be
+      // extracted on this path, so a stale one is not detected either.
+      hasStatusline = fs.readFileSync(settingsPath, 'utf8').includes('"statusLine"');
+    }
+    const scripts = hasStatusline && configured ? statuslineScripts(configured.command) : null;
+    if (scripts) {
+      // An accepted stable copy (<claudeDir>/hooks/) is ours to keep current:
+      // refresh it from the running script, not only when nudging.
+      for (const script of scripts) {
+        const name = path.basename(script);
+        if (path.resolve(script) === path.resolve(claudeDir, 'hooks', name)) stableStatuslinePath(name);
+      }
+      if (scripts.every((script) => !fs.existsSync(script))) {
+        // Configured, but pointing at a script that is gone: the status bar is
+        // hidden right now and the one-shot marker is already set.
+        staleKind = 'gone';
+      } else if (scripts.some(statuslineScriptOutdated)) {
+        staleKind = 'outdated';
+      }
+      if (staleKind) {
+        hasStatusline = false;
+        staleCommand = String(configured.command);
+      }
     }
   }
 
-  if (!hasStatusline && !fs.existsSync(nudgeMarkerPath)) {
-    safeWriteFlag(nudgeMarkerPath, '1');
-    const isWindows = process.platform === 'win32';
-    const scriptName = isWindows ? 'caveman-statusline.ps1' : 'caveman-statusline.sh';
-    const scriptPath = path.join(__dirname, scriptName);
+  // Re-offer a dead path once per distinct broken command, so a user who
+  // declines is not asked again every session.
+  const stalePath = path.join(claudeDir, '.caveman-statusline-stale');
+  let alreadyReported = false;
+  if (staleCommand) {
+    try {
+      alreadyReported = fs.readFileSync(stalePath, 'utf8') === staleCommand;
+    } catch (e) {
+      alreadyReported = false;
+    }
+  }
+
+  if (!hasStatusline && (staleCommand ? !alreadyReported : !fs.existsSync(nudgeMarkerPath))) {
+    if (staleCommand) safeWriteFlag(stalePath, staleCommand);
+    else safeWriteFlag(nudgeMarkerPath, '1');
+    const scriptPath = stableStatuslinePath(scriptName) || path.join(__dirname, scriptName);
     const command = isWindows
       ? `powershell -ExecutionPolicy Bypass -File "${scriptPath}"`
       : `bash "${scriptPath}"`;
     const statusLineSnippet =
       '"statusLine": { "type": "command", "command": ' + JSON.stringify(command) + ' }';
     output += "\n\n" +
-      "STATUSLINE SETUP NEEDED: The caveman plugin includes a statusline badge showing active mode " +
-      "(e.g. [CAVEMAN], [CAVEMAN:ULTRA]). It is not configured yet. " +
-      "To enable, add this to " + path.join(claudeDir, 'settings.json') + ": " +
+      (staleCommand
+        ? "STATUSLINE REPAIR NEEDED: The caveman statusline badge is configured to run " +
+          (staleKind === 'outdated'
+            ? "an outdated copy of its script (" + staleCommand + "), which cannot show the current modes. "
+            : "a script that no longer exists (" + staleCommand + "), which hides the Claude Code status bar. ") +
+          "STATUSLINE SETUP NEEDED: repoint it in "
+        : "STATUSLINE SETUP NEEDED: The caveman plugin includes a statusline badge showing active mode " +
+          "(e.g. [CAVEMAN], [ULTRACAVE]). It is not configured yet. " +
+          "To enable, add this to ") +
+      path.join(claudeDir, 'settings.json') + ": " +
       statusLineSnippet + " " +
       "Proactively offer to set this up for the user on first interaction.";
   }

@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/JuliusBrussee/caveman/engine"
@@ -106,15 +107,19 @@ type Runtime struct {
 	sessionLocks          [64]sync.Mutex
 	repositoryMu          sync.RWMutex
 	repositoryMaps        map[string]*repositoryMapEntry
-	repositorySessionRefs map[string]string
+	repositorySessionRefs map[string]repositorySessionRef
 	repositoryWarming     map[string]bool
-	repositoryEnded       map[string]bool
+	repositoryEnded       map[string]time.Time
 	activeSessions        map[string]sessionActivity
 	lastActivity          time.Time
 	// detect classifies a tool output so afterTool can tell what the elision
 	// engine could do with it. Deterministic, local, no store and no network. A
 	// nil detect means "cannot classify", which masks — see maskWouldDiscardFacts.
 	detect func([]byte) string
+	// OnTurnStart, when set, runs on every session.start and prompt.submit,
+	// before the model request they announce (the Cloud link warms its route
+	// path). It must not block.
+	OnTurnStart func()
 }
 
 type sessionActivity struct {
@@ -124,16 +129,30 @@ type sessionActivity struct {
 	Model    string
 }
 
+// repositorySessionRef is the stored repository-map object for one session,
+// with the last time that session created or read it. The timestamp is what
+// lets pruneRepositoryState reclaim a session whose host disappeared without
+// ever sending session.end, which repositoryEnded alone cannot see.
+type repositorySessionRef struct {
+	id string
+	at time.Time
+}
+
 type repositoryMapEntry struct {
 	done    chan struct{}
 	repoMap repointel.Map
 	err     error
+	// lastAccess is unix nanoseconds of the last time a session created or
+	// read this entry. pruneRepositoryState reclaims entries idle past
+	// repositoryPruneWindow. Atomic because repositoryEvidenceContext and
+	// captureTestImpact only hold repositoryMu.RLock when they touch it.
+	lastAccess atomic.Int64
 }
 
 func newRuntime(store *ccr.Store) *Runtime {
 	return &Runtime{
 		store: store, repositoryMaps: map[string]*repositoryMapEntry{},
-		repositorySessionRefs: map[string]string{}, repositoryWarming: map[string]bool{}, repositoryEnded: map[string]bool{},
+		repositorySessionRefs: map[string]repositorySessionRef{}, repositoryWarming: map[string]bool{}, repositoryEnded: map[string]time.Time{},
 		activeSessions: map[string]sessionActivity{}, lastActivity: time.Now(),
 		// A store-less engine: Detect reads only the bytes handed to it.
 		detect: engine.New(nil, nil).Detect,
@@ -232,6 +251,14 @@ func (r *Runtime) Handle(_ context.Context, request Request) (Response, error) {
 	request.Profile = profile
 	r.mu.Lock()
 	r.lastActivity = time.Now()
+	// Listener lifetime is independent of session bookkeeping. Prune abandoned
+	// correlation entries lazily so a persistent proxy does not retain them
+	// forever when a host disappears without session.end.
+	for sessionID, activity := range r.activeSessions {
+		if r.lastActivity.Sub(activity.At) >= 30*time.Minute {
+			delete(r.activeSessions, sessionID)
+		}
+	}
 	if request.Event.Type == "session.end" {
 		delete(r.activeSessions, request.Session.ID)
 	} else {
@@ -251,6 +278,7 @@ func (r *Runtime) Handle(_ context.Context, request Request) (Response, error) {
 		r.activeSessions[request.Session.ID] = activity
 	}
 	r.mu.Unlock()
+	r.pruneRepositoryState()
 	response := Response{
 		ProtocolVersion: ProtocolVersion,
 		PolicyMode:      policyMode,
@@ -261,6 +289,9 @@ func (r *Runtime) Handle(_ context.Context, request Request) (Response, error) {
 		DecisionID:      decisionID(request, request.Event.Type),
 	}
 	err = nil
+	if r.OnTurnStart != nil && (request.Event.Type == "session.start" || request.Event.Type == "prompt.submit") {
+		r.OnTurnStart()
+	}
 	switch request.Event.Type {
 	case "session.start":
 		if features.repository {
@@ -513,42 +544,6 @@ func (r *Runtime) Keepalive() {
 	r.mu.Unlock()
 }
 
-// WaitForIdle returns true only after every observed session ended and timeout
-// elapsed. Explicit long-running gateway owners do not call it.
-func (r *Runtime) WaitForIdle(ctx context.Context, idleTimeout time.Duration) bool {
-	if idleTimeout <= 0 {
-		return false
-	}
-	poll := idleTimeout / 4
-	if poll < 10*time.Millisecond {
-		poll = 10 * time.Millisecond
-	}
-	if poll > time.Second {
-		poll = time.Second
-	}
-	ticker := time.NewTicker(poll)
-	defer ticker.Stop()
-	for {
-		now := time.Now()
-		r.mu.Lock()
-		for sessionID, activity := range r.activeSessions {
-			if now.Sub(activity.At) >= idleTimeout {
-				delete(r.activeSessions, sessionID)
-			}
-		}
-		active, last := len(r.activeSessions), r.lastActivity
-		r.mu.Unlock()
-		if active == 0 && time.Since(last) >= idleTimeout {
-			return true
-		}
-		select {
-		case <-ctx.Done():
-			return false
-		case <-ticker.C:
-		}
-	}
-}
-
 // startRepositoryEvidence warms deterministic repository metadata outside hook
 // latency. No model/network call occurs; prompt hooks consume only completed maps.
 func (r *Runtime) startRepositoryEvidence(request Request) {
@@ -562,7 +557,7 @@ func (r *Runtime) startRepositoryEvidence(request Request) {
 	// was never closed (the warming goroutine below only starts when !exists), so
 	// the next request for that key blocked its waiter forever and
 	// repositoryWarming stayed true for the rest of the session.
-	if r.repositorySessionRefs[request.Session.ID] != "" || r.repositoryWarming[request.Session.ID] {
+	if r.repositorySessionRefs[request.Session.ID].id != "" || r.repositoryWarming[request.Session.ID] {
 		r.repositoryMu.Unlock()
 		return
 	}
@@ -571,6 +566,7 @@ func (r *Runtime) startRepositoryEvidence(request Request) {
 		entry = &repositoryMapEntry{done: make(chan struct{})}
 		r.repositoryMaps[key] = entry
 	}
+	entry.lastAccess.Store(time.Now().UnixNano())
 	r.repositoryWarming[request.Session.ID] = true
 	r.repositoryMu.Unlock()
 
@@ -602,7 +598,7 @@ func (r *Runtime) startRepositoryEvidence(request Request) {
 		if err == nil {
 			var id string
 			r.repositoryMu.Lock()
-			if r.repositoryEnded[request.Session.ID] {
+			if !r.repositoryEnded[request.Session.ID].IsZero() {
 				delete(r.repositoryWarming, request.Session.ID)
 				r.repositoryMu.Unlock()
 				return
@@ -613,7 +609,7 @@ func (r *Runtime) startRepositoryEvidence(request Request) {
 				Currentness: ccr.Current, Lifecycle: ccr.Warm, Data: data,
 			})
 			if err == nil {
-				r.repositorySessionRefs[request.Session.ID] = id
+				r.repositorySessionRefs[request.Session.ID] = repositorySessionRef{id: id, at: time.Now()}
 			}
 			r.repositoryMu.Unlock()
 		}
@@ -625,9 +621,45 @@ func (r *Runtime) startRepositoryEvidence(request Request) {
 
 func (r *Runtime) markRepositorySessionEnded(sessionID string) {
 	r.repositoryMu.Lock()
-	r.repositoryEnded[sessionID] = true
+	r.repositoryEnded[sessionID] = time.Now()
 	delete(r.repositoryWarming, sessionID)
 	r.repositoryMu.Unlock()
+}
+
+// repositoryPruneWindow mirrors the activeSessions lazy-prune window in
+// Handle: repository-evidence bookkeeping for a session or a (CWD,
+// RepositoryState) key untouched this long belongs to nothing still running.
+const repositoryPruneWindow = 30 * time.Minute
+
+// pruneRepositoryState reclaims repositoryEnded, repositorySessionRefs and
+// repositoryMaps entries idle past repositoryPruneWindow. There is no
+// background ticker for this state, same as activeSessions: it only shrinks
+// when the next request drives it.
+func (r *Runtime) pruneRepositoryState() {
+	now := time.Now()
+	r.repositoryMu.Lock()
+	defer r.repositoryMu.Unlock()
+	for sessionID, endedAt := range r.repositoryEnded {
+		if now.Sub(endedAt) >= repositoryPruneWindow {
+			delete(r.repositoryEnded, sessionID)
+			delete(r.repositorySessionRefs, sessionID)
+		}
+	}
+	// repositoryEnded is only ever written by session.end, so keying the ref
+	// prune off it alone retains a ref forever for any host that disappeared
+	// without sending one. Prune by idleness too, exactly as the activeSessions
+	// sweep in Handle already does for the same reason.
+	for sessionID, ref := range r.repositorySessionRefs {
+		if now.Sub(ref.at) >= repositoryPruneWindow {
+			delete(r.repositorySessionRefs, sessionID)
+			delete(r.repositoryEnded, sessionID)
+		}
+	}
+	for key, entry := range r.repositoryMaps {
+		if now.Sub(time.Unix(0, entry.lastAccess.Load())) >= repositoryPruneWindow {
+			delete(r.repositoryMaps, key)
+		}
+	}
 }
 
 func (r *Runtime) transitionAfterCompaction(sessionID string) error {
@@ -673,13 +705,21 @@ func (r *Runtime) repositoryEvidenceContext(request Request) (string, string, er
 	}
 	r.startRepositoryEvidence(request)
 	key := repositoryKey(request.Session)
-	r.repositoryMu.RLock()
+	r.repositoryMu.Lock()
 	entry := r.repositoryMaps[key]
-	mapRef := r.repositorySessionRefs[request.Session.ID]
-	r.repositoryMu.RUnlock()
+	ref := r.repositorySessionRefs[request.Session.ID]
+	mapRef := ref.id
+	// Touch on read as well as on write: a live session that keeps asking for
+	// evidence must never have its own ref pruned out from under it.
+	if mapRef != "" {
+		ref.at = time.Now()
+		r.repositorySessionRefs[request.Session.ID] = ref
+	}
+	r.repositoryMu.Unlock()
 	if entry == nil {
 		return "Caveman repository evidence: unavailable; no path claims injected.", "", nil
 	}
+	entry.lastAccess.Store(time.Now().UnixNano())
 	select {
 	case <-entry.done:
 		r.repositoryMu.RLock()
@@ -1192,7 +1232,9 @@ func (r *Runtime) afterTool(request Request, response Response, allowMask bool) 
 //
 // Only classes with a field grammar qualify, because only those produce
 // invariants: JSON records, CSV/TSV/markdown rows, and line-oriented logs
-// (logfmt and NDJSON both, via the log compressor's per-line reader). Everything
+// (logfmt and NDJSON both, via the log compressor's per-line reader), plus test
+// reports, whose compressor keeps every failure and the counts (pytest/Jest JSON
+// took this path as plain JSON before test-report existed). Everything
 // else — text, code, diff, terminal, HTML, config, search results, and anything
 // undetected — keeps today's masking behaviour exactly.
 //
@@ -1203,7 +1245,7 @@ func (r *Runtime) maskWouldDiscardFacts(output []byte) bool {
 		return false // cannot classify -> behave exactly as before
 	}
 	switch r.detect(output) {
-	case engine.TypeJSON, engine.TypeTabular, engine.TypeLog:
+	case engine.TypeJSON, engine.TypeTabular, engine.TypeLog, engine.TypeTestReport:
 		return true
 	default:
 		return false
@@ -1230,6 +1272,7 @@ func (r *Runtime) captureTestImpact(request Request, changedPath string) {
 	if entry == nil {
 		return
 	}
+	entry.lastAccess.Store(time.Now().UnixNano())
 	select {
 	case <-entry.done:
 		r.repositoryMu.RLock()

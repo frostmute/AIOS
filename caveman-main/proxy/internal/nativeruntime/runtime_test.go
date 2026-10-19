@@ -1117,7 +1117,7 @@ func TestRuntimeFailsClosedOnUnknownProtocolOrEvent(t *testing.T) {
 	}
 }
 
-func TestRuntimeIdleLifecycleTracksSessionsAndRecoversFromMissingEnd(t *testing.T) {
+func TestRuntimeTracksSessionsUntilSessionEnd(t *testing.T) {
 	store, err := ccr.OpenMemory()
 	if err != nil {
 		t.Fatal(err)
@@ -1132,16 +1132,6 @@ func TestRuntimeIdleLifecycleTracksSessionsAndRecoversFromMissingEnd(t *testing.
 	}
 	if active, _ := runtime.IdleSnapshot(); active != 1 {
 		t.Fatalf("active sessions = %d, want 1", active)
-	}
-	started := time.Now()
-	if !runtime.WaitForIdle(context.Background(), 30*time.Millisecond) {
-		t.Fatal("crashed session without SessionEnd must eventually idle")
-	}
-	if elapsed := time.Since(started); elapsed < 25*time.Millisecond {
-		t.Fatalf("idle returned too early: %v", elapsed)
-	}
-	if active, _ := runtime.IdleSnapshot(); active != 0 {
-		t.Fatalf("expired sessions = %d, want 0", active)
 	}
 
 	if _, err := runtime.Handle(context.Background(), Request{
@@ -1159,45 +1149,25 @@ func TestRuntimeIdleLifecycleTracksSessionsAndRecoversFromMissingEnd(t *testing.
 	}
 }
 
-// A wrap heartbeat must hold off idle exit even with zero session activity: an
-// open-but-quiet agent still points its ANTHROPIC_BASE_URL at this proxy (#860).
-func TestKeepaliveHoldsOffIdleExit(t *testing.T) {
+// Keepalive is the CLI's heartbeat for older proxies that still idle-exit. It
+// must move lastActivity without touching session accounting: a beat is activity
+// only, and counting it as a session would keep a dead wrap's proxy alive.
+func TestKeepaliveMarksActivityWithoutOpeningASession(t *testing.T) {
 	store, err := ccr.OpenMemory()
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer store.Close()
 	runtime := New(store)
-	stop := make(chan struct{})
-	// Heartbeat interval must sit far below the idle threshold, not merely
-	// under it. Windows' default timer granularity is ~15.6ms, so a 10ms ticker
-	// really fires every ~16ms and a loaded CI runner stretches that further; a
-	// 30ms threshold left barely a 2x margin and the idle timer won this race
-	// intermittently on windows-latest. 5ms against 250ms is ~50x, which
-	// survives a scheduling stall an order of magnitude worse than anything
-	// observed.
-	const heartbeat = 5 * time.Millisecond
-	const idleAfter = 250 * time.Millisecond
-	go func() {
-		ticker := time.NewTicker(heartbeat)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-stop:
-				return
-			case <-ticker.C:
-				runtime.Keepalive()
-			}
-		}
-	}()
-	ctx, cancel := context.WithTimeout(context.Background(), 600*time.Millisecond)
-	defer cancel()
-	if runtime.WaitForIdle(ctx, idleAfter) {
-		t.Fatal("idle exit fired while keepalive heartbeats were arriving")
+	_, before := runtime.IdleSnapshot()
+	time.Sleep(2 * time.Millisecond)
+	runtime.Keepalive()
+	active, after := runtime.IdleSnapshot()
+	if active != 0 {
+		t.Fatalf("Keepalive opened %d sessions", active)
 	}
-	close(stop)
-	if !runtime.WaitForIdle(context.Background(), idleAfter) {
-		t.Fatal("idle exit must fire once heartbeats stop")
+	if !after.After(before) {
+		t.Fatalf("Keepalive did not advance last activity: %v then %v", before, after)
 	}
 }
 
@@ -1476,5 +1446,193 @@ func TestStoredEvidenceBundleCarriesOnlyDirectItems(t *testing.T) {
 		if !item.Direct {
 			t.Fatalf("metadata-only item stored behind the ccr:// handle: %+v", item)
 		}
+	}
+}
+
+func TestPersistentRuntimePrunesAbandonedCorrelationEntries(t *testing.T) {
+	store, err := ccr.OpenMemory()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	r := New(store)
+	r.activeSessions["abandoned"] = sessionActivity{At: time.Now().Add(-time.Hour)}
+	r.activeSessions["recent"] = sessionActivity{At: time.Now()}
+	_, err = r.Handle(context.Background(), Request{
+		ProtocolVersion: 1, Agent: Agent{ID: "claude", Surface: "cli"},
+		Session: Session{ID: "new"}, Event: Event{Type: "prompt.submit"}, PolicyMode: "record",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := r.activeSessions["abandoned"]; ok {
+		t.Fatal("abandoned session retained forever")
+	}
+	if active, _ := r.IdleSnapshot(); active != 2 {
+		t.Fatalf("active correlation entries = %d, want recent and new", active)
+	}
+}
+
+func TestRepositoryStatePrunedAfterIdleWindow(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "handler.go"), []byte("package main\n\nfunc Serve() {}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	store, err := ccr.OpenMemory()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	r := New(store)
+
+	start := func(sessionID, repoState string) Session {
+		session := Session{ID: sessionID, CWD: root, RepositoryState: repoState}
+		if _, err := r.Handle(context.Background(), Request{
+			ProtocolVersion: 1, PolicyMode: "safe", Profile: "full-safe", Agent: Agent{ID: "claude"},
+			Session: session, Event: Event{Type: "session.start"},
+		}); err != nil {
+			t.Fatal(err)
+		}
+		waitForRepositoryMap(t, store, sessionID)
+		if _, err := r.Handle(context.Background(), Request{
+			ProtocolVersion: 1, PolicyMode: "safe", Profile: "full-safe", Agent: Agent{ID: "claude"},
+			Session: session, Event: Event{Type: "session.end"},
+		}); err != nil {
+			t.Fatal(err)
+		}
+		return session
+	}
+
+	stale := start("stale-session", "git:stale")
+	recent := start("recent-session", "git:recent")
+	staleKey := repositoryKey(stale)
+	recentKey := repositoryKey(recent)
+
+	// Backdate only the stale session, same as activeSessions above. The recent
+	// session stays untouched as the positive control.
+	r.repositoryMu.Lock()
+	entry, ok := r.repositoryMaps[staleKey]
+	if !ok {
+		r.repositoryMu.Unlock()
+		t.Fatal("stale session has no repositoryMaps entry to age")
+	}
+	entry.lastAccess.Store(time.Now().Add(-2 * repositoryPruneWindow).UnixNano())
+	r.repositoryEnded[stale.ID] = time.Now().Add(-2 * repositoryPruneWindow)
+	r.repositoryMu.Unlock()
+
+	// Drive one more request so Handle's lazy prune runs; there is no
+	// background ticker for this state, mirroring activeSessions.
+	if _, err := r.Handle(context.Background(), Request{
+		ProtocolVersion: 1, Agent: Agent{ID: "claude", Surface: "cli"},
+		Session: Session{ID: "unrelated-poke"}, Event: Event{Type: "prompt.submit"}, PolicyMode: "record",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	r.repositoryMu.RLock()
+	_, staleEndedThere := r.repositoryEnded[stale.ID]
+	_, staleRefThere := r.repositorySessionRefs[stale.ID]
+	_, staleMapThere := r.repositoryMaps[staleKey]
+	_, recentEndedThere := r.repositoryEnded[recent.ID]
+	_, recentRefThere := r.repositorySessionRefs[recent.ID]
+	_, recentMapThere := r.repositoryMaps[recentKey]
+	r.repositoryMu.RUnlock()
+
+	if staleEndedThere || staleRefThere || staleMapThere {
+		t.Fatalf("stale repository-evidence bookkeeping not pruned: ended=%v ref=%v map=%v",
+			staleEndedThere, staleRefThere, staleMapThere)
+	}
+	if !recentEndedThere || !recentRefThere || !recentMapThere {
+		t.Fatalf("recent repository-evidence bookkeeping incorrectly pruned: ended=%v ref=%v map=%v",
+			recentEndedThere, recentRefThere, recentMapThere)
+	}
+}
+
+// A host can disappear without ever sending session.end. repositoryEnded is
+// only written by session.end, so a ref prune keyed off it alone keeps one
+// entry per abandoned session forever — the same failure mode the activeSessions
+// sweep in Handle already guards against.
+func TestAbandonedSessionRepositoryRefsPrunedAfterIdleWindow(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "handler.go"), []byte("package main\n\nfunc Serve() {}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	store, err := ccr.OpenMemory()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	r := New(store)
+
+	start := func(sessionID, repoState string) {
+		session := Session{ID: sessionID, CWD: root, RepositoryState: repoState}
+		if _, err := r.Handle(context.Background(), Request{
+			ProtocolVersion: 1, PolicyMode: "safe", Profile: "full-safe", Agent: Agent{ID: "claude"},
+			Session: session, Event: Event{Type: "session.start"},
+		}); err != nil {
+			t.Fatal(err)
+		}
+		waitForRepositoryMap(t, store, sessionID)
+		// Deliberately no session.end.
+	}
+	start("abandoned-session", "git:abandoned")
+	start("live-session", "git:live")
+
+	// Age only the abandoned session's ref. The live session is the positive
+	// control: a ref must never be pruned out from under a session still asking.
+	r.repositoryMu.Lock()
+	ref, ok := r.repositorySessionRefs["abandoned-session"]
+	if !ok {
+		r.repositoryMu.Unlock()
+		t.Fatal("abandoned session has no repositorySessionRefs entry to age")
+	}
+	ref.at = time.Now().Add(-2 * repositoryPruneWindow)
+	r.repositorySessionRefs["abandoned-session"] = ref
+	r.repositoryMu.Unlock()
+
+	if _, err := r.Handle(context.Background(), Request{
+		ProtocolVersion: 1, Agent: Agent{ID: "claude", Surface: "cli"},
+		Session: Session{ID: "unrelated-poke"}, Event: Event{Type: "prompt.submit"}, PolicyMode: "record",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	r.repositoryMu.RLock()
+	_, abandonedThere := r.repositorySessionRefs["abandoned-session"]
+	_, liveThere := r.repositorySessionRefs["live-session"]
+	r.repositoryMu.RUnlock()
+	if abandonedThere {
+		t.Fatal("repositorySessionRefs retained for a session that never sent session.end")
+	}
+	if !liveThere {
+		t.Fatal("repositorySessionRefs pruned for a session still inside the idle window")
+	}
+}
+
+// A session or prompt start runs OnTurnStart (the Cloud link warms its route
+// path before the model request); no other event does.
+func TestTurnStartsRunOnTurnStart(t *testing.T) {
+	store, err := ccr.OpenMemory()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	runtime := New(store)
+	var starts []string
+	event := ""
+	runtime.OnTurnStart = func() { starts = append(starts, event) }
+	for _, event = range []string{"session.start", "tool.before", "prompt.submit", "turn.stop", "session.end"} {
+		if _, err := runtime.Handle(context.Background(), Request{
+			ProtocolVersion: 1, PolicyMode: "record",
+			Agent:   Agent{ID: "codex", Version: "1.0", Surface: "cli"},
+			Session: Session{ID: "s1", CWD: "/repo"},
+			Event:   Event{Type: event},
+			Tool:    &Tool{Name: "Bash"},
+		}); err != nil {
+			t.Fatalf("%s: %v", event, err)
+		}
+	}
+	if got := strings.Join(starts, ","); got != "session.start,prompt.submit" {
+		t.Fatalf("OnTurnStart ran on %q", got)
 	}
 }

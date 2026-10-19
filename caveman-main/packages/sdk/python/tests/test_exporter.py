@@ -154,7 +154,7 @@ def test_export_posts_otlp_payload_with_headers_and_attrs() -> None:
         captured.append((req.full_url, dict(req.headers), json.loads(req.data)))
         return _fake_urlopen({"ok": True, "spans_accepted": 2, "spans_total": 2, "otel_schema_version": "genai-2026-06"})
 
-    with patch("urllib.request.urlopen", side_effect=fake_urlopen):
+    with patch("caveman_cloud.core._urlopen", side_effect=fake_urlopen):
         result = exp.export()
 
     assert len(captured) == 1
@@ -223,7 +223,7 @@ def test_export_empty_is_noop_no_network() -> None:
     def boom(req, timeout):  # type: ignore[no-untyped-def]
         raise AssertionError("export() must not hit the network when empty")
 
-    with patch("urllib.request.urlopen", side_effect=boom):
+    with patch("caveman_cloud.core._urlopen", side_effect=boom):
         result = exp.export()
     assert result == {"ok": True, "spans_accepted": 0, "spans_total": 0}
 
@@ -252,7 +252,7 @@ def test_overlapping_exports_serialize_without_duplicate_or_dropped_spans() -> N
         except BaseException as exc:
             errors.append(exc)
 
-    with patch("urllib.request.urlopen", side_effect=fake_urlopen):
+    with patch("caveman_cloud.core._urlopen", side_effect=fake_urlopen):
         first = threading.Thread(target=run_export)
         first.start()
         assert first_started.wait(timeout=2)
@@ -279,3 +279,21 @@ def test_custom_service_name() -> None:
     payload = exp.build_payload()
     res_attrs = _attr_map(payload["resourceSpans"][0]["resource"]["attributes"])
     assert res_attrs["service.name"] == "custom-svc"
+
+
+def test_record_span_emits_semconv_cache_creation_usage() -> None:
+    # E11: OTel GenAI semconv usage names; the deprecated cost_usd attribute is still emitted during 1.x.
+    span = Cave(api_key="k", base_url="http://localhost:8787", agent="a").exporter().record_span(
+        "chat",
+        input_tokens=100,
+        cached_tokens=40,
+        cache_creation_tokens=25,
+        cost_usd=0.5,
+        attributes={"gen_ai.usage.cache_creation.input_tokens": 999},
+    )
+    assert span.attributes["gen_ai.usage.cache_read.input_tokens"] == 40
+    assert span.attributes["gen_ai.usage.cache_creation.input_tokens"] == 25
+    assert span.attributes["gen_ai.usage.cost_usd"] == 0.5
+    assert "gen_ai.usage.cached_tokens" not in span.attributes
+    bad = Cave(api_key="k", base_url="http://localhost:8787", agent="a").exporter().record_span("chat", cache_creation_tokens=-1)
+    assert "gen_ai.usage.cache_creation.input_tokens" not in bad.attributes

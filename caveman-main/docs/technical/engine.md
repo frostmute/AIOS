@@ -5,8 +5,7 @@ model context. It detects input shape, chooses a matching compressor, stores
 exact source when a lossy transform needs recovery, and emits output only when
 the result passes size and safety checks.
 
-Engine source is licensed under the Business Source License 1.1. Interfaces and
-adoption packages use their package-level licenses. See
+Engine source is licensed under Apache-2.0, like the rest of the repository. See
 [`LICENSING.md`](../../LICENSING.md).
 
 ## Library calls
@@ -52,6 +51,7 @@ passes input through.
 Automatic detection recognizes:
 
 - JSON;
+- test reports (a JUnit XML root element, or top-level pytest-json-report or Jest JSON keys, that parse with at least one test);
 - terminal output;
 - diffs;
 - HTML;
@@ -69,7 +69,7 @@ by general detection.
 
 ## Compressor registry
 
-Default registry contains 15 compressors:
+Default registry contains 16 compressors:
 
 1. JSON
 2. log
@@ -86,6 +86,18 @@ Default registry contains 15 compressors:
 13. accessibility tree
 14. repetition
 15. terminal output
+16. test report (JUnit, pytest, Jest): keeps the counts and every failure
+
+The code compressor keeps imports, signatures, and type declarations and elides
+function bodies. A cgo build parses Go, Python, TypeScript, JavaScript, Rust,
+Java, C, and C++ with tree-sitter; the pure-Go build parses Go with the
+standard library. The release `caveman-proxy` and `caveman-engine` are cgo
+builds on all six targets, cross-compiled with a pinned zig
+(`scripts/build-release-binaries.mjs`); releases up to bin-v2.0.2 were pure-Go,
+so their code compression covered Go only. The other four release binaries,
+the container image, and any `CGO_ENABLED=0` source build are still pure-Go.
+GDScript is elided by a line scanner in both builds: the language is
+indentation-scoped and has no grammar in either.
 
 Each compressor declares a safety class and implements its own parse and output
 rules. Current compressors belong to lossy class S4, even when a particular

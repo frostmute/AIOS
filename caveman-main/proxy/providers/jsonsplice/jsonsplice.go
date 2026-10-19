@@ -6,6 +6,10 @@ import (
 	"fmt"
 )
 
+// maxSpliceBytes bounds the inputs of an edit so the output's size
+// arithmetic cannot overflow; no provider body comes near it.
+const maxSpliceBytes = 1 << 30
+
 type Span struct{ Start, End int }
 
 type Candidate struct {
@@ -141,6 +145,9 @@ func ReplaceRaw(body []byte, span Span, replacement []byte) ([]byte, error) {
 	if !json.Valid(replacement) {
 		return nil, fmt.Errorf("json splice: replacement is not valid JSON")
 	}
+	if len(body) > maxSpliceBytes || len(replacement) > maxSpliceBytes {
+		return nil, fmt.Errorf("json splice: body too large")
+	}
 	out := make([]byte, 0, len(body)-(span.End-span.Start)+len(replacement))
 	out = append(out, body[:span.Start]...)
 	out = append(out, replacement...)
@@ -186,6 +193,50 @@ func AppendObjectFields(body []byte, object Span, fields ...FieldInsertion) ([]b
 		addition.Write(field.Value)
 	}
 
+	if len(body) > maxSpliceBytes || addition.Len() > maxSpliceBytes {
+		return nil, fmt.Errorf("json splice: body too large")
+	}
+	out := make([]byte, 0, len(body)+addition.Len())
+	out = append(out, body[:insertAt]...)
+	out = append(out, addition.Bytes()...)
+	out = append(out, body[insertAt:]...)
+	return out, nil
+}
+
+// AppendArrayElements inserts elements immediately before an array's closing
+// bracket. Existing bytes, whitespace, and element order remain untouched.
+func AppendArrayElements(body []byte, array Span, elements ...[]byte) ([]byte, error) {
+	if array.Start < 0 || array.End > len(body) || array.Start >= array.End ||
+		body[array.Start] != '[' || body[array.End-1] != ']' {
+		return nil, fmt.Errorf("json splice: invalid array range")
+	}
+	if len(elements) == 0 {
+		return body, nil
+	}
+
+	insertAt := array.End - 1
+	for insertAt > array.Start+1 && bytes.ContainsRune([]byte(" \n\r\t"), rune(body[insertAt-1])) {
+		insertAt--
+	}
+	hasElements := insertAt > array.Start+1
+
+	var addition bytes.Buffer
+	if hasElements {
+		addition.WriteByte(',')
+	}
+	for i, element := range elements {
+		if !json.Valid(element) {
+			return nil, fmt.Errorf("json splice: invalid element insertion")
+		}
+		if i > 0 {
+			addition.WriteByte(',')
+		}
+		addition.Write(element)
+	}
+
+	if len(body) > maxSpliceBytes || addition.Len() > maxSpliceBytes {
+		return nil, fmt.Errorf("json splice: body too large")
+	}
 	out := make([]byte, 0, len(body)+addition.Len())
 	out = append(out, body[:insertAt]...)
 	out = append(out, addition.Bytes()...)

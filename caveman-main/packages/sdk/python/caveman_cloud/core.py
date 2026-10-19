@@ -9,11 +9,33 @@ import os
 import secrets
 import threading
 import time
+import urllib.error
 import urllib.request
 from contextlib import contextmanager
 from urllib.parse import quote, urlsplit
 from dataclasses import dataclass, field
 from typing import Any, Callable, Iterator, Literal
+
+
+class _RejectRedirects(urllib.request.HTTPRedirectHandler):
+    """Keep gateway and upstream credentials on the configured endpoint."""
+
+    def http_error_302(self, req: Any, fp: Any, code: int, msg: str, response_headers: Any) -> Any:
+        # urllib otherwise forwards Authorization and custom credential headers
+        # to another origin. Close the redirect response before raising, since
+        # the caller never receives a response context manager in this case.
+        fp.close()
+        raise urllib.error.HTTPError(req.full_url, code, "cave_redirect_not_allowed", response_headers, None)
+
+    http_error_301 = http_error_302
+    http_error_303 = http_error_302
+    http_error_307 = http_error_302
+    http_error_308 = http_error_302
+
+
+def _urlopen(req: urllib.request.Request, *, timeout: float) -> Any:
+    # A private opener avoids changing urllib's process-wide redirect policy.
+    return urllib.request.build_opener(_RejectRedirects()).open(req, timeout=timeout)
 
 
 def _strict_non_negative_int(value: Any) -> int | None:
@@ -735,7 +757,7 @@ class Cave:
             headers=headers(self, wf),
             method="POST",
         )
-        with urllib.request.urlopen(req, timeout=30) as response:
+        with _urlopen(req, timeout=30) as response:
             data = json.loads(response.read())
 
         sent = _strict_non_negative_int(data.get("sent_schema_tokens"))
@@ -799,7 +821,7 @@ class Cave:
             method="POST",
         )
         try:
-            with urllib.request.urlopen(req, timeout=300) as response:
+            with _urlopen(req, timeout=300) as response:
                 data = json.loads(response.read())
         except Exception:  # noqa: BLE001 — fail-closed: any failure ⇒ pass-through.
             return passthrough()
@@ -864,7 +886,7 @@ class Cave:
             headers=otlp_headers(self),
             method="GET",
         )
-        with urllib.request.urlopen(req, timeout=30) as response:
+        with _urlopen(req, timeout=30) as response:
             return json.loads(response.read())
 
     def runtime_policy(
@@ -930,7 +952,7 @@ class _SharedContext:
             headers=headers(self._cave, self._cave.default_workflow),
             method=method,
         )
-        with urllib.request.urlopen(req, timeout=300) as response:
+        with _urlopen(req, timeout=300) as response:
             return json.loads(response.read())
 
 
@@ -1004,7 +1026,7 @@ class _ContextPacking:
             method="POST",
         )
         try:
-            with urllib.request.urlopen(req, timeout=30) as response:
+            with _urlopen(req, timeout=30) as response:
                 data = json.loads(response.read())
         except Exception:  # noqa: BLE001 — lossy selector must fail closed to caller-owned context.
             return passthrough()
@@ -1236,7 +1258,7 @@ class Trace:
             headers=request_headers,
             method="POST",
         )
-        with urllib.request.urlopen(req, timeout=30) as response:
+        with _urlopen(req, timeout=30) as response:
             return json.loads(response.read())
 
     def _get(self, path: str) -> dict[str, Any]:
@@ -1250,7 +1272,7 @@ class Trace:
             ),
             method="GET",
         )
-        with urllib.request.urlopen(req, timeout=30) as response:
+        with _urlopen(req, timeout=30) as response:
             return json.loads(response.read())
 
 
@@ -1293,7 +1315,7 @@ class Provider:
             ),
             method="POST",
         )
-        with urllib.request.urlopen(req, timeout=300) as response:
+        with _urlopen(req, timeout=300) as response:
             return json.loads(response.read())
 
     def raw(self, path: str, body: dict[str, Any]) -> dict[str, Any]:
@@ -1653,6 +1675,7 @@ class OTelExporter:
         cached_tokens: int | None = None,
         cost_usd: float | None = None,
         workflow: str | None = None,
+        cache_creation_tokens: int | None = None,
         status: str = "ok",
         start_time_ns: int | None = None,
         end_time_ns: int | None = None,
@@ -1673,10 +1696,14 @@ class OTelExporter:
             "gen_ai.usage.cached_tokens",
             "gen_ai.usage.cache_read.input_tokens",
             "gen_ai.usage.cost_usd",
+            "caveman.usage.cost_usd",
             "cave.agent",
             "cave.workflow",
         ):
             attrs.pop(reserved, None)
+        # SDK 1.1.0 passed a caller-supplied cache-write count through; the typed argument replaces it only when given.
+        if cache_creation_tokens is not None:
+            attrs.pop("gen_ai.usage.cache_creation.input_tokens", None)
         if operation is not None:
             attrs["gen_ai.operation.name"] = operation
         if provider is not None:
@@ -1695,8 +1722,14 @@ class OTelExporter:
             attrs["gen_ai.usage.output_tokens"] = valid_output
         if valid_cached is not None and (valid_input is None or valid_cached <= valid_input):
             attrs["gen_ai.usage.cache_read.input_tokens"] = valid_cached
+        valid_creation = _strict_non_negative_int(cache_creation_tokens)
+        if valid_creation is not None:  # never clamped to input: Anthropic reports cache writes outside input_tokens
+            attrs["gen_ai.usage.cache_creation.input_tokens"] = valid_creation
+        # `caveman.usage.cost_usd` carries the cost. `gen_ai.usage.cost_usd` is not an OTel GenAI semconv name and is
+        # deprecated; it stays through 1.x because the gateway importer reads it.
         if isinstance(cost_usd, (int, float)) and not isinstance(cost_usd, bool) and math.isfinite(float(cost_usd)) and cost_usd >= 0:
             attrs["gen_ai.usage.cost_usd"] = float(cost_usd)
+            attrs["caveman.usage.cost_usd"] = float(cost_usd)
         attrs["cave.agent"] = self.cave.agent
         attrs["cave.workflow"] = workflow or self.cave.default_workflow
 
@@ -1764,7 +1797,7 @@ class OTelExporter:
                     headers=otlp_headers(self.cave),
                     method="POST",
                 )
-                with urllib.request.urlopen(req, timeout=30) as response:
+                with _urlopen(req, timeout=30) as response:
                     data: dict[str, Any] = json.loads(response.read())
                 succeeded = True
                 return data
@@ -1933,7 +1966,7 @@ def policy_unit_fraction(*keys: str) -> float:
     """Deterministic [0,1) fraction for a tuple of keys — the experiment
     assignment unit.
 
-    Byte-for-byte port of the Go ``shared/platform/sampling.Fraction``: one
+    Byte-for-byte port of the Go Caveman-Cloud ``shared/platform/sampling.Fraction``: one
     SHA-256 over each key preceded by an 8-byte big-endian prefix carrying the
     key's UTF-8 byte length, then the first 8 digest bytes read big-endian,
     shifted right 11 and divided by 2^53. The length prefix is what keeps
@@ -2292,7 +2325,7 @@ class RuntimePolicyClient:
             method="GET",
         )
         try:
-            with urllib.request.urlopen(req, timeout=30) as response:
+            with _urlopen(req, timeout=30) as response:
                 raw = response.read(_POLICY_MAX_RESPONSE_BYTES + 1)
         except Exception:  # noqa: BLE001 — the agent's path must not depend on this call.
             return RuntimePolicyRefresh(ok=False, signed=self._signed, error="transport")

@@ -6,9 +6,9 @@
 //   Configuration is invalid at .../cavecrew-reviewer.md
 //   ↳ Expected object | undefined, got ["Read","Grep","Bash"] tools
 //
-// Fix: strip the `tools:` field on copy. These tests prove the helper
-// strips the field, preserves every other frontmatter key and the body,
-// and handles both the inline array form and the multi-line YAML list form.
+// Fix: strip the `tools:` field on copy. Source cavecrew agents now omit it too
+// for Gemini compatibility (#373), while the helper still handles older copied
+// forms, preserving every other frontmatter key and the body.
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
@@ -20,7 +20,7 @@ import { createRequire } from 'node:module';
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = path.resolve(HERE, '..', '..');
 const requireCjs = createRequire(import.meta.url);
-const { transformOpencodeAgentFrontmatter } = requireCjs(path.join(REPO_ROOT, 'bin', 'lib', 'opencode-agent.js'));
+const { transformOpencodeAgentFrontmatter } = requireCjs(path.join(REPO_ROOT, 'installer', 'lib', 'opencode-agent.js'));
 
 const SHIPPED_AGENT_FILES = ['cavecrew-investigator.md', 'cavecrew-builder.md', 'cavecrew-reviewer.md'];
 
@@ -116,15 +116,12 @@ test('non-string input returns unchanged', () => {
   assert.deepEqual(transformOpencodeAgentFrontmatter({ x: 1 }), { x: 1 });
 });
 
-// ── Real shipped agent files: every one must transform to opencode-safe ──
-// This is the RED-state proof: each `agents/cavecrew-*.md` in the repo today
-// contains the offending `tools: [...]` form, which is what broke opencode
-// startup in the reported bug. After transform, the field is gone.
-test('all shipped cavecrew agent files contain offending tools array (RED proof)', () => {
+// ── Real shipped agent files: every one must already be tool-list safe ──
+test('all shipped cavecrew agent files omit tool lists at source', () => {
   for (const f of SHIPPED_AGENT_FILES) {
     const src = fs.readFileSync(path.join(REPO_ROOT, 'agents', f), 'utf8');
     const fm = frontmatter(src);
-    assert.match(fm, /^tools:\s*\[/m, `source ${f} should contain inline array form (this is the bug)`);
+    assert.doesNotMatch(fm, /^tools:/m, `source ${f} must not declare runtime-specific tools`);
   }
 });
 
@@ -245,4 +242,26 @@ test('shipped cavecrew agents carry no bare alias after transform', () => {
       assert.match(model[1], /\//, `${file}: any surviving model must be provider-qualified, got ${model[1]}`);
     }
   }
+});
+
+// ── opencode Tab cycle (#725) ─────────────────────────────────────────────
+// opencode defaults an agent's `mode` to `all`, and Tab cycles every
+// primary-capable agent, so the cavecrew helpers landed in the Tab rotation.
+test('subagent option adds `mode: subagent` when frontmatter has no mode', () => {
+  const src = '---\nname: a\ndescription: >\n  folded text\n---\nbody\n';
+  const out = transformOpencodeAgentFrontmatter(src, { subagent: true });
+  assert.match(frontmatter(out), /^mode: subagent$/m);
+  assert.match(frontmatter(out), /^description: >\n {2}folded text$/m, 'folded description intact');
+  assert.match(out, /\n---\nbody\n$/, 'body intact');
+});
+
+test('subagent option keeps an explicit mode and never duplicates it', () => {
+  const src = '---\nname: a\nmode: primary\n---\nbody\n';
+  const out = transformOpencodeAgentFrontmatter(src, { subagent: true });
+  assert.equal(out, src);
+});
+
+test('no option leaves mode out (OMP bytes unchanged)', () => {
+  const src = '---\nname: a\n---\nbody\n';
+  assert.equal(transformOpencodeAgentFrontmatter(src), src);
 });

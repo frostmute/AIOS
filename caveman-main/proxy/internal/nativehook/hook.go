@@ -26,8 +26,9 @@ const maxPayloadBytes = 2 * 1024 * 1024
 type hostEvent map[string]any
 
 // Run processes one host callback. Adapter failures deliberately emit nothing
-// and return nil: host command continues unchanged.
-func Run(ctx context.Context, home, agent, adapterPath string, raw []byte, stdout, stderr io.Writer) error {
+// and return nil: host command continues unchanged. nodePath is the node the
+// hook was wired with; empty means $NODE, then PATH.
+func Run(ctx context.Context, home, agent, adapterPath, nodePath string, raw []byte, stdout, stderr io.Writer) error {
 	if len(raw) == 0 || len(raw) > maxPayloadBytes || !validAgent(agent) {
 		return nil
 	}
@@ -37,7 +38,7 @@ func Run(ctx context.Context, home, agent, adapterPath string, raw []byte, stdou
 	}
 	eventName := normalizeEvent(agent, firstString(event, "hook_event_name", "event_name", "event"))
 	if eventName != "PreToolUse" && eventName != "PermissionRequest" {
-		delegate(ctx, adapterPath, agent, raw, stdout, stderr)
+		delegate(ctx, adapterPath, nodePath, agent, raw, stdout, stderr)
 		return nil
 	}
 	sessionID := bounded(firstString(event, "session_id", "sessionId"), 160)
@@ -157,19 +158,24 @@ func toolNeedsRepositoryState(name string, input any) bool {
 	return fields[0] == "pytest" || fields[0] == "test" || fields[0] == "build" || (fields[0] == "go" && len(fields) > 1 && (fields[1] == "test" || fields[1] == "build"))
 }
 
+// repositoryStatusBudget bounds `git status` on a search/test/build pre-tool
+// hook. It was 100ms, which an idle `git status` on a ~1.5k-file checkout
+// already takes 70-80ms of, so ordinary load emptied the state. The cost only
+// lands when status is slow, and 500ms plus the runtime call's 250ms stays far
+// inside the host's hook timeout.
+const repositoryStatusBudget = 500 * time.Millisecond
+
 func currentRepositoryState(ctx context.Context, cwd string) string {
 	if cwd == "" {
 		return ""
 	}
-	statusCtx, cancel := context.WithTimeout(ctx, 100*time.Millisecond)
+	statusCtx, cancel := context.WithTimeout(ctx, repositoryStatusBudget)
 	defer cancel()
 	// `status` refreshes the index, which runs core.fsmonitor — this is the
 	// hottest git call we make against a repository we do not trust. Disabling
 	// fsmonitor costs the people who configured it BECAUSE their repo is huge:
-	// if status then misses the 100ms budget above, repository state comes back
-	// empty and reuse silently stops. That degrades safely, and moving the
-	// budget is a latency decision for every user, so it needs a measurement
-	// this fix does not have.
+	// if status then misses the budget, repository state comes back empty and
+	// reuse silently stops. That degrades safely.
 	cmd := gitsafe.Command(statusCtx, cwd, "status", "--porcelain=v1", "-z", "--branch", "--untracked-files=all")
 	var status bytes.Buffer
 	cmd.Stdout = &status
@@ -295,12 +301,17 @@ func nativePolicy(home string) (string, string) {
 	}
 }
 
+// configuredMode reads the CLI's config: $CAVEMAN_HOME/cloud.json, then the
+// pre-v4 ~/.caveman-cloud/config.json it is copied from on first use.
 func configuredMode(home string) string {
 	userHome := os.Getenv("HOME")
 	if userHome == "" {
 		userHome = filepath.Dir(home)
 	}
-	raw, err := os.ReadFile(filepath.Join(userHome, ".caveman-cloud", "config.json"))
+	raw, err := os.ReadFile(filepath.Join(home, "cloud.json"))
+	if home == "" || os.IsNotExist(err) {
+		raw, err = os.ReadFile(filepath.Join(userHome, ".caveman-cloud", "config.json"))
+	}
 	if err != nil {
 		return "compress"
 	}
@@ -381,15 +392,11 @@ func recordFallback(home, agent, eventName, sessionID, toolName string, raw []by
 	_ = os.Chmod(path, 0o600)
 }
 
-func delegate(ctx context.Context, adapterPath, agent string, raw []byte, stdout, stderr io.Writer) {
+func delegate(ctx context.Context, adapterPath, nodePath, agent string, raw []byte, stdout, stderr io.Writer) {
 	if adapterPath == "" {
 		return
 	}
-	node := os.Getenv("NODE")
-	if node == "" {
-		node = "node"
-	}
-	cmd := exec.CommandContext(ctx, node, adapterPath, "native-hook", agent)
+	cmd := exec.CommandContext(ctx, nodeCommand(nodePath), adapterPath, "native-hook", agent)
 	cmd.Stdin = bytes.NewReader(raw)
 	var out, errOut bytes.Buffer
 	cmd.Stdout = &out
@@ -399,6 +406,23 @@ func delegate(ctx context.Context, adapterPath, agent string, raw []byte, stdout
 	}
 	_, _ = stdout.Write(out.Bytes())
 	_, _ = stderr.Write(errOut.Bytes())
+}
+
+// nodeCommand picks the node that runs the adapter. Hosts started from a GUI
+// or launchd often have no node on PATH (nvm, volta, Homebrew), and a bare
+// `node` then failed every lifecycle hook silently, so a stopped runtime was
+// never revived. The node recorded at setup wins while it still exists; after
+// an nvm switch removes it, $NODE and then PATH still get a chance.
+func nodeCommand(recorded string) string {
+	if recorded != "" {
+		if info, err := os.Stat(recorded); err == nil && !info.IsDir() {
+			return recorded
+		}
+	}
+	if node := os.Getenv("NODE"); node != "" {
+		return node
+	}
+	return "node"
 }
 
 func firstString(event hostEvent, keys ...string) string {

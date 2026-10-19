@@ -6,13 +6,17 @@
 package store
 
 import (
+	"context"
 	"database/sql"
+	"database/sql/driver"
 	"fmt"
 	"log/slog"
 	"math"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/JuliusBrussee/caveman/proxy/internal/gateway"
@@ -29,8 +33,11 @@ const storeTSLayout = "2006-01-02 15:04:05.000"
 
 // Store is a SQLite-backed TelemetrySink.
 type Store struct {
-	db     *sql.DB
-	logger *slog.Logger
+	db               *sql.DB
+	logger           *slog.Logger
+	persistent       bool
+	middlewareWriter chan struct{}
+	prefixWrites     atomic.Int64
 }
 
 const schema = `
@@ -53,6 +60,7 @@ CREATE TABLE IF NOT EXISTS requests (
   provider_cache_component_sha256 TEXT,
   cache_boundary_known INTEGER,
   cache_bust INTEGER,
+  cache_bust_cause TEXT,
   compression_eligible INTEGER,
   agent_slug TEXT,
   provider TEXT,
@@ -89,7 +97,27 @@ CREATE TABLE IF NOT EXISTS requests (
   compression_token_count_basis TEXT,
   recovery_handle TEXT,
   would_save_tokens INTEGER,
-  would_save_usd REAL
+  would_save_usd REAL,
+  cache_creation_1h_tokens INTEGER,
+  request_tokens_before INTEGER,
+  request_tokens_after INTEGER,
+  request_token_basis TEXT,
+  request_measurement_status TEXT,
+  request_estimated_input_delta_usd REAL,
+  request_savings_basis TEXT,
+  pricing_known INTEGER,
+  pricing_provider TEXT,
+  pricing_model TEXT,
+  pricing_catalog_version TEXT,
+  price_input_per_million REAL,
+  price_output_per_million REAL,
+  price_cache_read_per_million REAL,
+  price_cache_write_per_million REAL,
+  price_cache_write_1h_per_million REAL,
+  price_reasoning_per_million REAL,
+  route_pool_id TEXT,
+  route_reason TEXT,
+  upstream_response_id TEXT
 );
 
 CREATE TABLE IF NOT EXISTS usage_events (
@@ -206,6 +234,12 @@ CREATE TABLE IF NOT EXISTS prefix_replacements (
   last_used_at TEXT NOT NULL
 );
 
+CREATE INDEX IF NOT EXISTS idx_prefix_replacements_lru
+  ON prefix_replacements(last_used_at, original_sha256);
+
+CREATE INDEX IF NOT EXISTS idx_prefix_replacements_handle_lru
+  ON prefix_replacements(handle, last_used_at, original_sha256);
+
 CREATE TABLE IF NOT EXISTS learn_sinks (
   sink_id TEXT PRIMARY KEY,
   title TEXT NOT NULL,
@@ -274,6 +308,23 @@ var migrations = []string{
 	`ALTER TABLE requests ADD COLUMN compression_token_count_basis TEXT`,
 	`ALTER TABLE requests ADD COLUMN would_save_tokens INTEGER`,
 	`ALTER TABLE requests ADD COLUMN would_save_usd REAL`,
+	`ALTER TABLE requests ADD COLUMN cache_creation_1h_tokens INTEGER`,
+	`ALTER TABLE requests ADD COLUMN request_tokens_before INTEGER`,
+	`ALTER TABLE requests ADD COLUMN request_tokens_after INTEGER`,
+	`ALTER TABLE requests ADD COLUMN request_token_basis TEXT`,
+	`ALTER TABLE requests ADD COLUMN request_measurement_status TEXT`,
+	`ALTER TABLE requests ADD COLUMN request_estimated_input_delta_usd REAL`,
+	`ALTER TABLE requests ADD COLUMN request_savings_basis TEXT`,
+	`ALTER TABLE requests ADD COLUMN pricing_known INTEGER`,
+	`ALTER TABLE requests ADD COLUMN pricing_provider TEXT`,
+	`ALTER TABLE requests ADD COLUMN pricing_model TEXT`,
+	`ALTER TABLE requests ADD COLUMN pricing_catalog_version TEXT`,
+	`ALTER TABLE requests ADD COLUMN price_input_per_million REAL`,
+	`ALTER TABLE requests ADD COLUMN price_output_per_million REAL`,
+	`ALTER TABLE requests ADD COLUMN price_cache_read_per_million REAL`,
+	`ALTER TABLE requests ADD COLUMN price_cache_write_per_million REAL`,
+	`ALTER TABLE requests ADD COLUMN price_cache_write_1h_per_million REAL`,
+	`ALTER TABLE requests ADD COLUMN price_reasoning_per_million REAL`,
 	`ALTER TABLE requests ADD COLUMN session_id TEXT`,
 	`ALTER TABLE requests ADD COLUMN session_correlation_basis TEXT NOT NULL DEFAULT 'uncorrelated'`,
 	`ALTER TABLE requests ADD COLUMN agent_build_sha256 TEXT`,
@@ -287,8 +338,12 @@ var migrations = []string{
 	`ALTER TABLE requests ADD COLUMN provider_cache_component_sha256 TEXT`,
 	`ALTER TABLE requests ADD COLUMN cache_boundary_known INTEGER`,
 	`ALTER TABLE requests ADD COLUMN cache_bust INTEGER`,
+	`ALTER TABLE requests ADD COLUMN cache_bust_cause TEXT`,
 	`ALTER TABLE requests ADD COLUMN compression_eligible INTEGER`,
 	`ALTER TABLE requests ADD COLUMN request_hash_complete INTEGER NOT NULL DEFAULT 0`,
+	`ALTER TABLE requests ADD COLUMN route_pool_id TEXT`,
+	`ALTER TABLE requests ADD COLUMN route_reason TEXT`,
+	`ALTER TABLE requests ADD COLUMN upstream_response_id TEXT`,
 	`ALTER TABLE usage_events ADD COLUMN cache_creation_input_tokens INTEGER`,
 	`ALTER TABLE learn_sinks ADD COLUMN tokens_observed INTEGER`,
 }
@@ -316,6 +371,18 @@ func sqliteDSN(path string) string {
 // Open opens (creating if needed) the SQLite database at path and migrates the
 // schema. logger may be nil.
 func Open(path string, logger *slog.Logger) (*Store, error) {
+	if path != ":memory:" {
+		// SQLite creates -wal and -shm with the database file's mode, and they
+		// hold the same plaintext as the database: create the file 0600 before
+		// SQLite first opens it, and tighten what an older build left at the
+		// umask's mode.
+		if f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0o600); err == nil {
+			_ = f.Close()
+		}
+		for _, suffix := range []string{"", "-wal", "-shm"} {
+			_ = os.Chmod(path+suffix, 0o600)
+		}
+	}
 	db, err := sql.Open("sqlite", sqliteDSN(path))
 	if err != nil {
 		return nil, fmt.Errorf("open sqlite %q: %w", path, err)
@@ -324,17 +391,17 @@ func Open(path string, logger *slog.Logger) (*Store, error) {
 		_ = db.Close()
 		return nil, fmt.Errorf("migrate sqlite %q: %w", path, err)
 	}
-	if path != ":memory:" {
-		_ = os.Chmod(path, 0o600)
-	}
 	for _, m := range migrations {
 		if _, err := db.Exec(m); err != nil && !strings.Contains(err.Error(), "duplicate column name") {
 			_ = db.Close()
 			return nil, fmt.Errorf("migrate sqlite %q: %w", path, err)
 		}
 	}
-	return &Store{db: db, logger: logger}, nil
+	return &Store{db: db, logger: logger, persistent: path != ":memory:", middlewareWriter: make(chan struct{}, 1)}, nil
 }
+
+// Persistent reports whether this store retains middleware choices on restart.
+func (s *Store) Persistent() bool { return s != nil && s.persistent }
 
 // Close closes the underlying database.
 func (s *Store) Close() error { return s.db.Close() }
@@ -344,6 +411,86 @@ func (s *Store) Close() error { return s.db.Close() }
 // traffic (the byte-safe ethos). Basis is recorded as the lifecycle set it —
 // always "inferred" in standalone.
 func (s *Store) Record(rec gateway.RequestRecord) {
+	sanitizeRequestRecord(&rec)
+	if _, err := s.db.Exec(insertRequestSQL, requestRecordArgs(&rec)...); err != nil && s.logger != nil {
+		s.logger.Warn("local spend store insert failed", "error", err, "request_id", rec.RequestID)
+	}
+}
+
+// RecordBatch persists rows in one transaction (gateway.BatchSink): the rows
+// Record would write, with one commit. If the transaction cannot be used, each
+// row falls back to Record.
+//
+// The commit runs with synchronous(NORMAL) on its own connection: under WAL
+// that syncs at checkpoints instead of on every commit, so the request rows
+// cost no fsync each. A power loss or OS crash can drop the last batches
+// committed before it; a process crash or a clean exit loses none. Every
+// other write to this database (recovery originals, the prefix-replacement
+// cache, middleware state) keeps the default FULL.
+func (s *Store) RecordBatch(recs []gateway.RequestRecord) {
+	// Middleware writes wait their turn here rather than in SQLite's busy
+	// handler (see middlewareWrite).
+	s.middlewareWriter <- struct{}{}
+	defer func() { <-s.middlewareWriter }()
+	if err := s.recordBatch(recs); err != nil {
+		if s.logger != nil {
+			s.logger.Warn("local spend store batch failed; writing rows one by one", "error", err, "rows", len(recs))
+		}
+		for _, rec := range recs {
+			s.Record(rec)
+		}
+	}
+}
+
+func (s *Store) recordBatch(recs []gateway.RequestRecord) error {
+	ctx := context.Background()
+	conn, err := s.db.Conn(ctx)
+	if err != nil {
+		return err
+	}
+	var level int
+	if err := conn.QueryRowContext(ctx, `PRAGMA synchronous`).Scan(&level); err != nil {
+		_ = conn.Close()
+		return err
+	}
+	defer func() {
+		if _, err := conn.ExecContext(ctx, `PRAGMA synchronous=`+strconv.Itoa(level)); err != nil {
+			// Never hand a NORMAL connection back to the pool.
+			_ = conn.Raw(func(any) error { return driver.ErrBadConn })
+		}
+		_ = conn.Close()
+	}()
+	if _, err := conn.ExecContext(ctx, `PRAGMA synchronous=NORMAL`); err != nil {
+		return err
+	}
+	tx, err := conn.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	// Runs before the restore above, so a panic mid-batch cannot leave the
+	// connection inside a transaction (no-op after Commit).
+	defer func() { _ = tx.Rollback() }()
+	stmt, err := tx.PrepareContext(ctx, insertRequestSQL)
+	if err != nil {
+		return err
+	}
+	for _, rec := range recs {
+		sanitizeRequestRecord(&rec)
+		// One failed insert fails the batch: it rolls back, and each row then
+		// gets its own Record, as it would have without batching.
+		if _, err := stmt.ExecContext(ctx, requestRecordArgs(&rec)...); err != nil {
+			return fmt.Errorf("insert request %s: %w", rec.RequestID, err)
+		}
+	}
+	_ = stmt.Close()
+	// A failed commit wrote nothing, so the rows are written again one by
+	// one. (Only a commit SQLite rolled back itself mid-batch, on a full
+	// disk or an I/O error, could leave earlier rows in and duplicate them.)
+	return tx.Commit()
+}
+
+// sanitizeRequestRecord is the persistence boundary's own validation of a row.
+func sanitizeRequestRecord(rec *gateway.RequestRecord) {
 	// Standalone is never allowed to mint Cloud verification, even if a buggy
 	// embedder passes a forged Basis. Enforce provenance again at persistence
 	// boundary instead of trusting lifecycle callers.
@@ -389,7 +536,7 @@ func (s *Store) Record(rec gateway.RequestRecord) {
 		rec.CacheBoundaryKnown = false
 	}
 	invalidTokens := rec.InputTokens < 0 || rec.OutputTokens < 0 || rec.CachedInputTokens < 0 ||
-		rec.CacheCreationInputTokens < 0 || rec.ReasoningTokens < 0 ||
+		rec.CacheCreationInputTokens < 0 || rec.CacheCreation1hTokens < 0 || rec.CacheCreation1hTokens > rec.CacheCreationInputTokens || rec.ReasoningTokens < 0 ||
 		rec.CachedInputTokens > rec.InputTokens ||
 		rec.CacheCreationInputTokens > rec.InputTokens-rec.CachedInputTokens ||
 		rec.ReasoningTokens > rec.OutputTokens
@@ -406,7 +553,7 @@ func (s *Store) Record(rec gateway.RequestRecord) {
 	if invalidTokens {
 		rec.TokenUsageBasis = "provider_malformed"
 		rec.InputTokens, rec.OutputTokens = 0, 0
-		rec.CachedInputTokens, rec.CacheCreationInputTokens, rec.ReasoningTokens = 0, 0, 0
+		rec.CachedInputTokens, rec.CacheCreationInputTokens, rec.CacheCreation1hTokens, rec.ReasoningTokens = 0, 0, 0, 0
 		rec.TotalCostUSD, rec.SavingsUSD = 0, 0
 	}
 	if !providers.ListPriceEligible(rec.Provider, rec.AuthMode) || rec.TokenUsageBasis != "provider_complete" {
@@ -465,22 +612,32 @@ func (s *Store) Record(rec gateway.RequestRecord) {
 		rec.RawRequestSHA256 = ""
 		rec.TransformedRequestSHA256 = ""
 	}
-	_, err := s.db.Exec(
-		`INSERT INTO requests (
+	sanitizeStatsMeasurement(rec)
+}
+
+const insertRequestSQL = `INSERT INTO requests (
 		    ts, request_id, trace_id, label, session_id, session_correlation_basis, agent_build_sha256, efficiency_plan_sha256,
 		    context_bill, transform_trace, transform_location, cache_epoch, cache_prefix_sha256,
-		    provider_cache_prefix_sha256, provider_cache_component_sha256, cache_boundary_known, cache_bust, compression_eligible,
+		    provider_cache_prefix_sha256, provider_cache_component_sha256, cache_boundary_known, cache_bust, cache_bust_cause, compression_eligible,
 		    agent_slug, provider, model, route_from, route_to, endpoint, stream,
             status_code, error_code, latency_ms, ttfb_ms, request_bytes, response_bytes,
             input_tokens, output_tokens, cached_input_tokens, cache_creation_input_tokens,
 		    reasoning_tokens, total_cost_usd, savings_usd, basis, token_usage_basis, auth_mode, runtime_mode,
             optimization_ids, cache_status, raw_request_sha256, transformed_request_sha256, request_hash_complete,
 		    compression_ratio, compression_tokens_before, compression_tokens_after, compression_token_count_basis, recovery_handle,
-		    would_save_tokens, would_save_usd
-		) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-		rec.Timestamp, rec.RequestID, rec.TraceID, rec.Label, rec.SessionID, rec.SessionCorrelationBasis, rec.AgentBuildSHA256, rec.EfficiencyPlanSHA256,
+		    would_save_tokens, would_save_usd,
+            cache_creation_1h_tokens, request_tokens_before, request_tokens_after,
+            request_token_basis, request_measurement_status, request_estimated_input_delta_usd, request_savings_basis,
+            pricing_known, pricing_provider, pricing_model, pricing_catalog_version,
+            price_input_per_million, price_output_per_million, price_cache_read_per_million,
+            price_cache_write_per_million, price_cache_write_1h_per_million, price_reasoning_per_million,
+            route_pool_id, route_reason, upstream_response_id
+		) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
+
+func requestRecordArgs(rec *gateway.RequestRecord) []any {
+	return []any{rec.Timestamp, rec.RequestID, rec.TraceID, rec.Label, rec.SessionID, rec.SessionCorrelationBasis, rec.AgentBuildSHA256, rec.EfficiencyPlanSHA256,
 		rec.ContextBill, rec.TransformTrace, rec.TransformLocation, rec.CacheEpoch, rec.CachePrefixSHA256,
-		rec.ProviderCachePrefixSHA256, rec.ProviderCacheComponentSHA256, rec.CacheBoundaryKnown, rec.CacheBust, rec.CompressionEligible,
+		rec.ProviderCachePrefixSHA256, rec.ProviderCacheComponentSHA256, rec.CacheBoundaryKnown, rec.CacheBust, rec.CacheBustCause, rec.CompressionEligible,
 		rec.AgentSlug, rec.Provider, rec.Model, rec.RouteFrom, rec.RouteTo, rec.Endpoint, rec.Stream,
 		rec.StatusCode, rec.ErrorCode, rec.LatencyMS, rec.TTFBMS, rec.RequestBytes, rec.ResponseBytes,
 		rec.InputTokens, rec.OutputTokens, rec.CachedInputTokens, rec.CacheCreationInputTokens,
@@ -488,9 +645,12 @@ func (s *Store) Record(rec gateway.RequestRecord) {
 		strings.Join(rec.OptimizationIDs, ","), rec.CacheStatus, rec.RawRequestSHA256, rec.TransformedRequestSHA256, rec.RequestHashComplete,
 		rec.CompressionRatio, rec.CompressionTokensBefore, rec.CompressionTokensAfter, rec.CompressionTokenCountBasis, rec.RecoveryHandle,
 		rec.WouldSaveTokens, rec.WouldSaveUSD,
-	)
-	if err != nil && s.logger != nil {
-		s.logger.Warn("local spend store insert failed", "error", err, "request_id", rec.RequestID)
+		rec.CacheCreation1hTokens, rec.RequestTokensBefore, rec.RequestTokensAfter,
+		rec.RequestTokenBasis, rec.RequestMeasurementStatus, rec.RequestEstimatedInputDeltaUSD, rec.RequestSavingsBasis,
+		rec.PricingKnown, rec.PricingProvider, rec.PricingModel, rec.PricingCatalogVersion,
+		rec.PriceInputPerMillion, rec.PriceOutputPerMillion, rec.PriceCacheReadPerMillion,
+		rec.PriceCacheWritePerMillion, rec.PriceCacheWrite1hPerMillion, rec.PriceReasoningPerMillion,
+		rec.RoutePoolID, rec.RouteReason, rec.UpstreamResponseID,
 	}
 }
 
@@ -505,11 +665,19 @@ type Stats struct {
 	CompressionTokensAfter     int64            `json:"compression_tokens_after"`
 	CompressionTokensSaved     int64            `json:"compression_tokens_saved"`
 	CompressionTokenCountBasis string           `json:"compression_token_count_basis"`
-	// CacheBustRequests counts requests whose frozen prefix did not extend the prior
-	// request in their session (observe-only). RequestsEligibleForCompression counts
+	// CacheBustRequests counts requests that did not extend what their session
+	// cached (observe-only). RequestsEligibleForCompression counts
 	// requests that reached the compression path as candidates (issue #133).
 	CacheBustRequests              int64 `json:"cache_bust_requests"`
 	RequestsEligibleForCompression int64 `json:"requests_eligible_for_compression"`
+	// CavemanCacheBustRequests counts the busts caveman caused: the client's
+	// bytes repeated a cached prefix and the forwarded bytes did not. Any is a bug.
+	CavemanCacheBustRequests int64 `json:"caveman_cache_bust_requests"`
+	// CacheWarmRequests counts the proxy's own prompt-cache warms (rows tagged
+	// cache-warm) inside Requests, and CacheWarmCostUSD their list-price spend
+	// inside TotalCost. A warm is never a user request and never a saving.
+	CacheWarmRequests int64   `json:"cache_warm_requests"`
+	CacheWarmCostUSD  float64 `json:"cache_warm_cost_usd"`
 	// WouldSaveTokens is the observe-only would-have-saved token total across all
 	// rows; WouldSaveUSD is its inferred dollar total (nil when no row was
 	// list-price eligible — never a guessed price). Neither is ever a booked saving.
@@ -552,9 +720,11 @@ type ObserveSummary struct {
 	// cached_input_tokens: the window was dominated by cache WRITES, so a small
 	// compression cut is not an honest headline saving and must be refused.
 	HeadlineCompressionRefused bool `json:"headline_compression_refused"`
-	// CacheBustRequests counts requests in the window whose frozen prefix did not
-	// extend the prior request in their session (observe-only; see prefix_monitor.go).
+	// CacheBustRequests counts requests in the window that did not extend what
+	// their session cached (observe-only; see prefix_monitor.go).
 	CacheBustRequests int64 `json:"cache_bust_requests"`
+	// CavemanCacheBustRequests is the subset caveman caused (see Stats).
+	CavemanCacheBustRequests int64 `json:"caveman_cache_bust_requests"`
 	// RequestsEligibleForCompression counts requests that reached the compression
 	// path as candidates, regardless of whether any bytes were saved (issue #133).
 	RequestsEligibleForCompression int64  `json:"requests_eligible_for_compression"`
@@ -678,8 +848,8 @@ func (s *Store) SessionUsage(sessionID string) (sessionusage.Snapshot, error) {
 	}
 	var compressionBases, correlationBases string
 	err := s.db.QueryRow(
-		`SELECT COUNT(*),
-		        COALESCE(SUM(CASE WHEN token_usage_basis = 'provider_complete' THEN 1 ELSE 0 END),0),
+		`SELECT COALESCE(SUM(CASE WHEN `+cacheWarmRow+` THEN 0 ELSE 1 END),0),
+		        COALESCE(SUM(CASE WHEN token_usage_basis = 'provider_complete' AND NOT `+cacheWarmRow+` THEN 1 ELSE 0 END),0),
 		        COALESCE(SUM(input_tokens),0), COALESCE(SUM(output_tokens),0),
 		        COALESCE(SUM(cached_input_tokens),0), COALESCE(SUM(cache_creation_input_tokens),0),
 		        COALESCE(SUM(reasoning_tokens),0), COALESCE(SUM(total_cost_usd),0),
@@ -722,6 +892,13 @@ func (s *Store) SessionUsage(sessionID string) (sessionusage.Snapshot, error) {
 	return out, nil
 }
 
+// cacheWarmRow matches the proxy's own prompt-cache warms: spend, but never an
+// agent request (no turn, no last request, no span).
+const cacheWarmRow = "COALESCE(optimization_ids,'') = 'cache-warm'"
+
+// notCacheWarm is the WHERE clause of a query over agent requests only.
+const notCacheWarm = " WHERE NOT (" + cacheWarmRow + ")"
+
 // Summary returns aggregate spend across all recorded requests. The savings
 // basis is "inferred" whenever any row carries a non-`verified` basis, which in
 // standalone is always — the value is never re-projected to a monthly figure.
@@ -733,13 +910,18 @@ func (s *Store) Summary() (Stats, error) {
 		COALESCE(SUM(compression_tokens_before),0), COALESCE(SUM(compression_tokens_after),0),
 		COALESCE(SUM(would_save_tokens),0), COUNT(would_save_usd), COALESCE(SUM(would_save_usd),0),
 		COALESCE(SUM(CASE WHEN cache_bust <> 0 THEN 1 ELSE 0 END),0),
-		COALESCE(SUM(CASE WHEN compression_eligible <> 0 THEN 1 ELSE 0 END),0)
+		COALESCE(SUM(CASE WHEN compression_eligible <> 0 THEN 1 ELSE 0 END),0),
+		COALESCE(SUM(CASE WHEN cache_bust_cause = 'caveman' THEN 1 ELSE 0 END),0),
+		COALESCE(SUM(CASE WHEN ` + cacheWarmRow + ` THEN 1 ELSE 0 END),0),
+		COALESCE(SUM(CASE WHEN ` + cacheWarmRow + ` THEN total_cost_usd ELSE 0 END),0)
 		FROM requests`)
 	if err := row.Scan(&out.Requests, &out.TotalCost, &out.TotalSaved, &out.CompressionTokensBefore, &out.CompressionTokensAfter,
 		&out.WouldSaveTokens, &wouldSaveUSDCount, &wouldSaveUSDSum,
-		&out.CacheBustRequests, &out.RequestsEligibleForCompression); err != nil {
+		&out.CacheBustRequests, &out.RequestsEligibleForCompression, &out.CavemanCacheBustRequests,
+		&out.CacheWarmRequests, &out.CacheWarmCostUSD); err != nil {
 		return out, err
 	}
+	out.CacheWarmCostUSD = roundUSD(out.CacheWarmCostUSD)
 	out.CompressionTokensSaved = out.CompressionTokensBefore - out.CompressionTokensAfter
 	if out.CompressionTokensSaved < 0 {
 		out.CompressionTokensSaved = 0
@@ -786,14 +968,15 @@ func (s *Store) Summary() (Stats, error) {
 // produced one.
 func (s *Store) ObserveSummarySince(since string) (ObserveSummary, error) {
 	out := ObserveSummary{Basis: "inferred", TokenAccounting: map[string]int64{}}
-	where := ""
+	// The proxy's own cache warms are not spans of the session.
+	where := notCacheWarm
 	var args []any
 	if trimmed := strings.TrimSpace(since); trimmed != "" {
 		t, err := time.Parse(time.RFC3339, trimmed)
 		if err != nil {
 			return out, fmt.Errorf("invalid --since %q (want RFC3339): %w", trimmed, err)
 		}
-		where = " WHERE ts >= ?"
+		where += " AND ts >= ?"
 		args = append(args, t.UTC().Format(storeTSLayout))
 	}
 	var usdCount int64
@@ -804,13 +987,14 @@ func (s *Store) ObserveSummarySince(since string) (ObserveSummary, error) {
 		COALESCE(SUM(savings_usd),0), COUNT(would_save_usd), COALESCE(SUM(would_save_usd),0),
 		COALESCE(SUM(cached_input_tokens),0), COALESCE(SUM(cache_creation_input_tokens),0),
 		COALESCE(SUM(CASE WHEN cache_bust <> 0 THEN 1 ELSE 0 END),0),
-		COALESCE(SUM(CASE WHEN compression_eligible <> 0 THEN 1 ELSE 0 END),0)
+		COALESCE(SUM(CASE WHEN compression_eligible <> 0 THEN 1 ELSE 0 END),0),
+		COALESCE(SUM(CASE WHEN cache_bust_cause = 'caveman' THEN 1 ELSE 0 END),0)
 		FROM requests`+where, args...)
 	if err := row.Scan(&out.Spans, &out.TokensIn, &out.WouldSaveTokens,
 		&out.CompressionTokensBefore, &out.CompressionTokensAfter, &out.CompressionTokensSaved,
 		&out.SavingsUSD, &usdCount, &usdSum,
 		&out.CachedInputTokens, &out.CacheCreationInputTokens,
-		&out.CacheBustRequests, &out.RequestsEligibleForCompression); err != nil {
+		&out.CacheBustRequests, &out.RequestsEligibleForCompression, &out.CavemanCacheBustRequests); err != nil {
 		return out, err
 	}
 	if out.CachedInputTokens < 0 {
@@ -864,8 +1048,10 @@ func roundUSDCents(v float64) float64 {
 	return math.Round(v*100) / 100
 }
 
+// countRequestProvenance counts agent requests: cache warms (inside
+// Stats.Requests, disclosed as CacheWarmRequests) are in neither breakdown.
 func (s *Store) countRequestProvenance(column string, out map[string]int64) error {
-	return s.countRequestProvenanceWhere(column, out, "")
+	return s.countRequestProvenanceWhere(column, out, notCacheWarm)
 }
 
 func (s *Store) countRequestProvenanceWhere(column string, out map[string]int64, where string, args ...any) error {
@@ -943,6 +1129,7 @@ func validEvidenceValue(value string, limit int) bool {
 
 // RecentRequests returns the N newest request rows. Empty stores return an empty
 // array; no synthetic row is ever created to make a first-request check pass.
+// A cache warm is the proxy's request, not the agent's, and is not listed.
 func (s *Store) RecentRequests(limit int) ([]RecentRequest, error) {
 	if limit <= 0 {
 		return []RecentRequest{}, nil
@@ -954,7 +1141,7 @@ func (s *Store) RecentRequests(limit int) ([]RecentRequest, error) {
 		`SELECT ts, COALESCE(agent_slug, ''), COALESCE(provider, ''), COALESCE(model, ''),
 		        COALESCE(endpoint, ''), COALESCE(input_tokens, 0), COALESCE(output_tokens, 0), basis,
 		        COALESCE(token_usage_basis, 'unavailable'), COALESCE(auth_mode, 'unknown')
-		   FROM requests
+		   FROM requests`+notCacheWarm+`
 		  ORDER BY ts DESC, id DESC
 		  LIMIT ?`,
 		limit,

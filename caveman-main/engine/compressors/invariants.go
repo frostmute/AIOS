@@ -3,6 +3,8 @@ package compressors
 import (
 	"bytes"
 	"encoding/json"
+	"io"
+	"math"
 	"regexp"
 	"sort"
 	"strconv"
@@ -173,6 +175,31 @@ type entry struct {
 // pasted far more freely than the body it replaced.
 var invariantSecretFieldRe = regexp.MustCompile(`(?i)(secret|passw|token|api[_-]?key|authoriz|credential|cookie|session)`)
 
+// invariantNumber parses a field value as a FINITE number, and is the only
+// place in this package that decides whether a value counts as numeric.
+//
+// strconv.ParseFloat is not that test on its own: it also accepts "NaN",
+// "Inf", "-Infinity" and friends, which is exactly how a CSV or logfmt export
+// spells a missing or undefined measurement (pandas, Postgres `numeric` NaN, R).
+// Such a value then parses without error, so the field stays on the numeric
+// track — and every comparison against NaN is false, so it neither widens the
+// range nor removes the field from it. The unit lands inside a run the marker
+// goes on to describe as `name=min..max`, stating a bound that unit does not
+// satisfy, with nothing in the compressed view left to say otherwise.
+//
+// That is the one claim this file may never make. A non-finite value is
+// therefore not a number here: the field leaves the numeric track and falls
+// through to enumeration or coverage, which state only exact, counted facts
+// ("amount: 500x26 NaN x1"). A run whose values are ALL "NaN" is still
+// constant and still reported as such, because that IS verified.
+func invariantNumber(value string) (float64, bool) {
+	n, err := strconv.ParseFloat(value, 64)
+	if err != nil || math.IsNaN(n) || math.IsInf(n, 0) {
+		return 0, false
+	}
+	return n, true
+}
+
 // summarizeElided renders the facts that hold across every unit of one elided
 // run, or "" when there are none, extraction found no structure, or the summary
 // would not fit its budget. elidedBytes is the size of the content the marker
@@ -221,10 +248,10 @@ func summarizeElided(units [][]field, elidedBytes int) string {
 				if len(order) >= invariantMaxTrackedFields {
 					continue
 				}
-				value, err := strconv.ParseFloat(f.value, 64)
+				value, isNumber := invariantNumber(f.value)
 				a = &agg{
 					constant:  true,
-					numeric:   err == nil,
+					numeric:   isNumber,
 					first:     f.value,
 					minStr:    f.value,
 					maxStr:    f.value,
@@ -242,9 +269,9 @@ func summarizeElided(units [][]field, elidedBytes int) string {
 				a.constant = false
 			}
 			if a.numeric {
-				value, err := strconv.ParseFloat(f.value, 64)
+				value, isNumber := invariantNumber(f.value)
 				switch {
-				case err != nil:
+				case !isNumber:
 					a.numeric = false
 				default:
 					if value < a.minVal {
@@ -370,8 +397,23 @@ func summarizeElided(units [][]field, elidedBytes int) string {
 	for i := range selected {
 		selected[i] = true
 	}
+	// Shedding is declared, never silent. A marker states only what it verified,
+	// and a trimmed `all …` list that reads as complete would let an agent
+	// conclude a field it cannot see was not constant — the same error
+	// enumerateField refuses a partial list to avoid. The count rides in a
+	// trailing `+N omitted` section.
+	//
+	// The notice is charged to the same budget as the facts, so both caps that
+	// govern a marker still hold exactly: the invariantMaxBytes ceiling, and the
+	// rule that a summary never costs more than half the bytes it replaced. A
+	// notice that rode outside the budget would break both on a tight run, and a
+	// marker that stops shrinking what it stands in for is the one thing a
+	// marker may never do. On the first pass nothing has been shed yet, so no
+	// notice is charged and an untrimmed summary renders byte-identically to
+	// before.
+	omitted := 0
 	for {
-		rendered := renderInvariants(entries, selected)
+		rendered := renderInvariants(entries, selected, omitted)
 		if len(rendered) <= budget {
 			return rendered
 		}
@@ -391,13 +433,20 @@ func summarizeElided(units [][]field, elidedBytes int) string {
 			return "" // nothing left to shed; the run buys no summary at all
 		}
 		selected[victim] = false
+		omitted++
 	}
 }
 
 // renderInvariants joins the selected entries into the marker summary: the
 // constants as one `all …` section, each enumeration as its own `name: v×n …`
 // section, the ranges as one `range …` section.
-func renderInvariants(entries []entry, selected []bool) string {
+//
+// omitted is how many entries the budget shed. When it is non-zero a trailing
+// `+N omitted` section says so, because every section above reads as the
+// complete set of facts of its kind and silently trimming one inverts its
+// meaning. A render with no sections left stays empty and takes no suffix: an
+// absent summary claims nothing, so it has nothing to qualify.
+func renderInvariants(entries []entry, selected []bool, omitted int) string {
 	sections := make([]string, 0, len(entries))
 	collect := func(kind int) []string {
 		var out []string
@@ -420,6 +469,12 @@ func renderInvariants(entries []entry, selected []bool) string {
 	}
 	if ranges := collect(kindRange); len(ranges) > 0 {
 		sections = append(sections, "range "+strings.Join(ranges, " "))
+	}
+	if len(sections) == 0 {
+		return ""
+	}
+	if omitted > 0 {
+		sections = append(sections, "+"+strconv.Itoa(omitted)+" omitted")
 	}
 	return strings.Join(sections, "; ")
 }
@@ -567,7 +622,7 @@ func lineFields(line []byte) []field {
 		decoder := json.NewDecoder(bytes.NewReader(trimmed))
 		decoder.UseNumber()
 		var event any
-		if err := decoder.Decode(&event); err == nil && !decoder.More() {
+		if err := decoder.Decode(&event); err == nil && decoder.Decode(new(any)) == io.EOF {
 			if fields := objectFields(event); len(fields) > 0 {
 				return fields
 			}
@@ -578,6 +633,9 @@ func lineFields(line []byte) []field {
 
 // logfmtFields extracts the `key=value` tokens of one log line, in order.
 func logfmtFields(line []byte) []field {
+	if !bytes.ContainsRune(line, '=') {
+		return nil
+	}
 	matches := logfmtPairRe.FindAllSubmatch(line, invariantMaxFieldsPerUnit)
 	if len(matches) == 0 {
 		return nil

@@ -1,12 +1,5 @@
-// Covers issue #836: `npx skills add` without -g writes to a PROJECT-local
-// ./.agents/skills under whatever directory the installer ran from. A user who
-// ran the curl|bash one-liner from ~/.local/bin got the skills in
-// ~/.local/bin/.agents/skills while Cursor's Skills UI reads ~/.cursor/skills —
-// the installer printed "Installation complete" and nothing ever appeared.
-//
-// A real `npx skills add` clones the repo and writes to the user's home, so
-// these tests substitute a fake `npx` on PATH that only records its argv.
-
+// Exercise the real installer with a recording npx shim. No download or user
+// configuration is touched. The .cmd shim exercises Windows' real launch path.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
@@ -14,96 +7,228 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { nodeStub, stubEnv } from '../../packages/cli/tests/harness/stub-bin.mjs';
+import { isolatedEnv } from './_isolated-env.mjs';
 
-const HERE = path.dirname(fileURLToPath(import.meta.url));
-const INSTALLER = path.resolve(HERE, '..', '..', 'bin', 'install.js');
+const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
+const INSTALLER = path.join(ROOT, 'installer/install.js');
+const profiles = [...fs.readFileSync(INSTALLER, 'utf8').matchAll(/id: '([^']+)'[^\n]+profile: '([^']+)'/g)]
+  .map(([, id, profile]) => ({ id, profile }))
+  .filter(({ id }) => !['continue', 'aider-desk', 'antigravity'].includes(id)); // Native copies: provider-skills-integration.test.mjs.
 
-// Runs the installer for one provider with a fake `npx` on PATH, and returns
-// the argv that fake npx was called with plus the sandboxed HOME.
-function runInstall(providerId) {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'caveman-skills-global-'));
-  const home = path.join(root, 'home');
-  const fakeBin = path.join(root, 'bin');
-  const argsLog = path.join(root, 'npx-args.json');
-  fs.mkdirSync(home, { recursive: true });
-  fs.mkdirSync(fakeBin, { recursive: true });
-
-  // The provider must also LOOK installed, or the installer skips it. Every
-  // skills-based provider we exercise here detects via a command on PATH.
-  const shim = `#!/bin/sh\nexit 0\n`;
-  for (const bin of ['cursor', 'windsurf']) {
-    fs.writeFileSync(path.join(fakeBin, bin), shim, { mode: 0o755 });
-  }
-  fs.writeFileSync(
-    path.join(fakeBin, 'npx'),
-    `#!/usr/bin/env node\nrequire("fs").writeFileSync(${JSON.stringify(argsLog)}, JSON.stringify(process.argv.slice(2)));\n`,
-    { mode: 0o755 },
-  );
-
-  const result = spawnSync(process.execPath, [INSTALLER, '--only', providerId], {
-    encoding: 'utf8',
-    env: {
-      ...process.env,
-      HOME: home,
-      USERPROFILE: home,
-      PATH: `${fakeBin}${path.delimiter}${process.env.PATH ?? ''}`,
-    },
+for (const { id, profile } of profiles) {
+  const projectOnly = id === 'replit';
+  test(`${id} installs every skill ${projectOnly ? 'in the project' : 'globally'} for only its selected profile`, (t) => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'caveman skills global '));
+    t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+    const home = path.join(dir, 'home');
+    const cwd = path.join(dir, 'unrelated project');
+    const bin = path.join(dir, 'bin');
+    const log = path.join(dir, 'argv.json');
+    fs.mkdirSync(home);
+    fs.mkdirSync(cwd);
+    nodeStub(bin, 'npx', `import fs from 'node:fs'; fs.writeFileSync(${JSON.stringify(log)}, JSON.stringify(ARGV));`);
+    const env = stubEnv({ ...isolatedEnv(home), IFLOW_HOME: '', CRUSH_SKILLS_DIR: '', CAVEMAN_REF: 'v9.9.9' }, bin);
+    const result = spawnSync(process.execPath, [INSTALLER, '--only', id, '--non-interactive'], {
+      encoding: 'utf8', cwd, env,
+    });
+    assert.equal(result.status, 0, result.stdout + result.stderr);
+    assert.deepEqual(JSON.parse(fs.readFileSync(log, 'utf8')), [
+      '-y', 'skills', 'add', 'JuliusBrussee/caveman#v9.9.9', '--skill', '*', '-a', profile, '--yes', ...(projectOnly ? [] : ['-g']),
+    ]);
+    if (projectOnly) assert.ok(result.stdout.includes(`Installing into this project: ${fs.realpathSync(cwd)}`), result.stdout);
+    assert.deepEqual(fs.readdirSync(cwd), [], 'install must not use the caller directory');
   });
-
-  const argv = fs.existsSync(argsLog) ? JSON.parse(fs.readFileSync(argsLog, 'utf8')) : null;
-  return { argv, home, result, cleanup: () => fs.rmSync(root, { recursive: true, force: true }) };
 }
 
-test('Cursor install passes -g so skills land in the user skills directory', { skip: process.platform === 'win32' }, () => {
-  const { argv, home, result, cleanup } = runInstall('cursor');
-  try {
-    assert.ok(argv, `fake npx was never invoked:\n${result.stdout}\n${result.stderr}`);
-    assert.ok(argv.includes('-g'), `expected -g in argv, got: ${JSON.stringify(argv)}`);
-    // The flag must not displace the agent selection — #389 showed --all
-    // ignores -a and writes every skill through every adapter.
-    assert.ok(argv.includes('-a'), 'agent selection must survive');
-    assert.strictEqual(argv[argv.indexOf('-a') + 1], 'cursor');
-    assert.ok(argv.includes('--skill'), '--skill * must survive (#370)');
-    assert.ok(fs.existsSync(path.join(home, '.cursor', 'skills')), 'target dir should be pre-created');
-  } finally {
-    cleanup();
-  }
+test('dry run plans a global install without creating directories or invoking npx', (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'caveman-global-dry-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const result = spawnSync(process.execPath, [INSTALLER, '--only', 'cursor', '--dry-run'], {
+    encoding: 'utf8', cwd: dir, env: isolatedEnv(dir),
+  });
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /-g\b/);
+  // Copy-pastable: an unquoted * would glob-expand to the files in cwd.
+  assert.match(result.stdout, /would run: npx -y skills add 'JuliusBrussee\/caveman#[^']+' --skill '\*' -a cursor/);
+  assert.deepEqual(fs.readdirSync(dir), []);
 });
 
-test('a provider with no known global skills dir is left alone', { skip: process.platform === 'win32' }, () => {
-  const { argv, result, cleanup } = runInstall('windsurf');
-  try {
-    assert.ok(argv, `fake npx was never invoked:\n${result.stdout}\n${result.stderr}`);
-    assert.ok(
-      !argv.includes('-g'),
-      `-g must be opt-in per provider, not blanket; got: ${JSON.stringify(argv)}`,
-    );
-  } finally {
-    cleanup();
-  }
+test('no detected agents must not install skills for every upstream profile', (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'caveman no agents '));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const bin = path.join(dir, 'bin');
+  const log = path.join(dir, 'unexpected-install.json');
+  nodeStub(bin, 'npx', `import fs from 'node:fs'; fs.writeFileSync(${JSON.stringify(log)}, JSON.stringify(ARGV));`);
+  // System-installed macOS apps are outside this fixture. Every other detection
+  // surface already resolves through the isolated home/PATH below.
+  const preload = path.join(dir, 'hide-system-apps.cjs');
+  fs.writeFileSync(preload, `const fs = require('fs'); const exists = fs.existsSync; fs.existsSync = p => String(p).startsWith('/Applications/') ? false : exists(p);`);
+  const env = isolatedEnv(dir);
+  Object.assign(env, { PATH: process.platform === 'win32' ? bin : `${bin}:/usr/bin:/bin`, HOME: dir, USERPROFILE: dir, APPDATA: dir, LOCALAPPDATA: dir, XDG_CONFIG_HOME: dir });
+  const result = spawnSync(process.execPath, ['--require', preload, INSTALLER, '--non-interactive'], { encoding: 'utf8', cwd: dir, env });
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(fs.existsSync(log), false, 'upstream --all installs agents that were never detected');
+  assert.match(result.stdout, /no agents detected/);
 });
 
-test('dry run reports the global dir it would create without writing it', { skip: process.platform === 'win32' }, () => {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'caveman-skills-global-dry-'));
-  const home = path.join(root, 'home');
-  const fakeBin = path.join(root, 'bin');
-  fs.mkdirSync(home, { recursive: true });
-  fs.mkdirSync(fakeBin, { recursive: true });
-  fs.writeFileSync(path.join(fakeBin, 'cursor'), '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+test('current Kiro and Mistral executables trigger their own install profiles', (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'caveman vendor commands '));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const bin = path.join(dir, 'bin');
+  nodeStub(bin, 'kiro-cli', 'process.exit(0);');
+  nodeStub(bin, 'vibe', 'process.exit(0);');
+  const preload = path.join(dir, 'hide-system-apps.cjs');
+  fs.writeFileSync(preload, `const fs = require('fs'); const exists = fs.existsSync; fs.existsSync = p => String(p).startsWith('/Applications/') ? false : exists(p);`);
+  const env = isolatedEnv(dir);
+  Object.assign(env, { PATH: process.platform === 'win32' ? bin : `${bin}:/usr/bin:/bin`, HOME: dir, USERPROFILE: dir, APPDATA: dir, LOCALAPPDATA: dir, XDG_CONFIG_HOME: dir });
+  const result = spawnSync(process.execPath, ['--require', preload, INSTALLER, '--minimal', '--dry-run', '--non-interactive'], {
+    encoding: 'utf8', cwd: dir, env,
+  });
+  assert.equal(result.status, 0, result.stdout + result.stderr);
+  assert.match(result.stdout, /Kiro CLI detected/);
+  assert.match(result.stdout, /-a kiro-cli --yes -g/);
+  assert.match(result.stdout, /Mistral Vibe detected/);
+  assert.match(result.stdout, /-a mistral-vibe --yes -g/);
+  assert.doesNotMatch(result.stdout, /no agents detected/);
+});
 
-  try {
-    const r = spawnSync(process.execPath, [INSTALLER, '--only', 'cursor', '--dry-run'], {
-      encoding: 'utf8',
-      env: {
-        ...process.env,
-        HOME: home,
-        USERPROFILE: home,
-        PATH: `${fakeBin}${path.delimiter}${process.env.PATH ?? ''}`,
-      },
+// #1189: the standalone GitHub Copilot CLI ships a `copilot` binary and reads
+// the github-copilot profile's global skills. Extension-only probes missed it.
+// AWS Copilot CLI ships a `copilot` binary too, so the binary counts only
+// beside GitHub Copilot CLI's ~/.copilot config dir.
+test('standalone Copilot CLI executable triggers the github-copilot profile', (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'caveman copilot cli '));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const bin = path.join(dir, 'bin');
+  nodeStub(bin, 'copilot', 'process.exit(0);');
+  const preload = path.join(dir, 'hide-system-apps.cjs');
+  fs.writeFileSync(preload, `const fs = require('fs'); const exists = fs.existsSync; fs.existsSync = p => String(p).startsWith('/Applications/') ? false : exists(p);`);
+  const env = isolatedEnv(dir);
+  delete env.COPILOT_HOME; // beside a `copilot` binary, a set COPILOT_HOME already means GitHub Copilot CLI
+  Object.assign(env, { PATH: process.platform === 'win32' ? bin : `${bin}:/usr/bin:/bin`, HOME: dir, USERPROFILE: dir, APPDATA: dir, LOCALAPPDATA: dir, XDG_CONFIG_HOME: dir });
+  const run = () => spawnSync(process.execPath, ['--require', preload, INSTALLER, '--minimal', '--dry-run', '--non-interactive'], {
+    encoding: 'utf8', cwd: dir, env,
+  });
+  const awsOnly = run();
+  assert.equal(awsOnly.status, 0, awsOnly.stdout + awsOnly.stderr);
+  assert.doesNotMatch(awsOnly.stdout, /GitHub Copilot detected/);
+  fs.mkdirSync(path.join(dir, '.copilot'));
+  const result = run();
+  assert.equal(result.status, 0, result.stdout + result.stderr);
+  assert.match(result.stdout, /GitHub Copilot detected/);
+  assert.match(result.stdout, /-a github-copilot --yes -g/);
+});
+
+// #408: CodeBuddy Code ships a `codebuddy` binary; upstream skills has a
+// `codebuddy` profile (~/.codebuddy/skills).
+test('CodeBuddy Code executable triggers the codebuddy profile', (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'caveman codebuddy '));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const bin = path.join(dir, 'bin');
+  nodeStub(bin, 'codebuddy', 'process.exit(0);');
+  const preload = path.join(dir, 'hide-system-apps.cjs');
+  fs.writeFileSync(preload, `const fs = require('fs'); const exists = fs.existsSync; fs.existsSync = p => String(p).startsWith('/Applications/') ? false : exists(p);`);
+  const env = isolatedEnv(dir);
+  Object.assign(env, { PATH: process.platform === 'win32' ? bin : `${bin}:/usr/bin:/bin`, HOME: dir, USERPROFILE: dir, APPDATA: dir, LOCALAPPDATA: dir, XDG_CONFIG_HOME: dir });
+  const result = spawnSync(process.execPath, ['--require', preload, INSTALLER, '--minimal', '--dry-run', '--non-interactive'], {
+    encoding: 'utf8', cwd: dir, env,
+  });
+  assert.equal(result.status, 0, result.stdout + result.stderr);
+  assert.match(result.stdout, /CodeBuddy Code detected/);
+  assert.match(result.stdout, /-a codebuddy --yes -g/);
+});
+
+// Goose keeps its config in $XDG_CONFIG_HOME/goose (~/.config/goose when that
+// is unset) and on Windows in %APPDATA%\Block\goose.
+test('Goose is found in its XDG or Windows config dir', (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'caveman goose '));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const bin = path.join(dir, 'bin');
+  nodeStub(bin, 'goose', 'process.exit(0);');
+  const preload = path.join(dir, 'hide-system-apps.cjs');
+  fs.writeFileSync(preload, `const fs = require('fs'); const exists = fs.existsSync; fs.existsSync = p => String(p).startsWith('/Applications/') ? false : exists(p);`);
+  const env = Object.fromEntries(Object.entries(process.env).filter(([key]) => !['path', 'xdg_config_home'].includes(key.toLowerCase())));
+  Object.assign(env, { PATH: process.platform === 'win32' ? bin : `${bin}:/usr/bin:/bin`, HOME: dir, USERPROFILE: dir, APPDATA: path.join(dir, 'appdata'), LOCALAPPDATA: dir });
+  const detected = (extra = {}) => {
+    const result = spawnSync(process.execPath, ['--require', preload, INSTALLER, '--minimal', '--dry-run', '--non-interactive'], {
+      encoding: 'utf8', cwd: dir, env: { ...env, ...extra },
     });
-    assert.match(r.stdout, /-g\b/, 'planned command must show the global flag');
-    assert.ok(!fs.existsSync(path.join(home, '.cursor', 'skills')), 'dry run must not write');
-  } finally {
-    fs.rmSync(root, { recursive: true, force: true });
-  }
+    assert.equal(result.status, 0, result.stdout + result.stderr);
+    return /Block Goose detected/.test(result.stdout);
+  };
+  const xdg = { XDG_CONFIG_HOME: path.join(dir, 'xdg') };
+  fs.mkdirSync(path.join(dir, '.config', 'goose'), { recursive: true });
+  assert.equal(detected(), true, '~/.config/goose with XDG_CONFIG_HOME unset');
+  assert.equal(detected(xdg), false, 'goose reads $XDG_CONFIG_HOME/goose, not ~/.config/goose');
+  fs.mkdirSync(path.join(dir, 'xdg', 'goose'), { recursive: true });
+  assert.equal(detected(xdg), true, '$XDG_CONFIG_HOME/goose');
+  fs.rmSync(path.join(dir, 'xdg', 'goose'), { recursive: true });
+  fs.mkdirSync(path.join(dir, 'appdata', 'Block', 'goose'), { recursive: true });
+  assert.equal(detected(xdg), true, '%APPDATA%\\Block\\goose');
+});
+
+// Cline ships as saoudrizwan.claude-dev, so a bare /cline/ never matched it but
+// did match Roo Code (rooveterinaryinc.roo-cline); /roo/ matched any Groovy
+// extension. goose, forge and bob are also a DB migrator, Foundry and a neovim
+// manager, so the binary alone is not an agent: its config dir must exist too.
+test('detection finds real Cline/Roo extensions and ignores look-alike names', (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'caveman look-alikes '));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const bin = path.join(dir, 'bin');
+  for (const name of ['goose', 'forge', 'bob']) nodeStub(bin, name, 'process.exit(0);');
+  const ext = path.join(dir, '.vscode', 'extensions');
+  fs.mkdirSync(path.join(ext, 'marlon407.code-groovy-0.1.2'), { recursive: true });
+  const preload = path.join(dir, 'hide-system-apps.cjs');
+  fs.writeFileSync(preload, `const fs = require('fs'); const exists = fs.existsSync; fs.existsSync = p => String(p).startsWith('/Applications/') ? false : exists(p);`);
+  const env = isolatedEnv(dir);
+  Object.assign(env, { PATH: process.platform === 'win32' ? bin : `${bin}:/usr/bin:/bin`, HOME: dir, USERPROFILE: dir, APPDATA: dir, LOCALAPPDATA: dir, XDG_CONFIG_HOME: dir });
+  const run = () => {
+    const result = spawnSync(process.execPath, ['--require', preload, INSTALLER, '--minimal', '--dry-run', '--non-interactive'], {
+      encoding: 'utf8', cwd: dir, env,
+    });
+    assert.equal(result.status, 0, result.stdout + result.stderr);
+    return result.stdout;
+  };
+  assert.doesNotMatch(run(), /(IBM Bob|ForgeCode|Block Goose|Roo Code|Cline) detected/);
+
+  // XDG_CONFIG_HOME is `dir` here, so Goose's config dir is dir/goose.
+  for (const name of ['.bob', '.forge', 'goose']) fs.mkdirSync(path.join(dir, name), { recursive: true });
+  fs.mkdirSync(path.join(ext, 'saoudrizwan.claude-dev-4.1.23'));
+  const found = run();
+  for (const label of ['IBM Bob', 'ForgeCode', 'Block Goose', 'Cline']) assert.match(found, new RegExp(`${label} detected`));
+  assert.doesNotMatch(found, /Roo Code detected/);
+
+  fs.rmSync(path.join(ext, 'saoudrizwan.claude-dev-4.1.23'), { recursive: true });
+  fs.mkdirSync(path.join(ext, 'rooveterinaryinc.roo-cline-3.25.0'));
+  const roo = run();
+  assert.match(roo, /Roo Code detected/);
+  assert.doesNotMatch(roo, /Cline detected/);
+});
+
+// Continue ships as Continue.continue and Augment as augment.vscode-augment;
+// a bare /continue/ or /augment/ matched any extension with the word in it.
+test('detection finds real Continue/Augment extensions and ignores look-alike names', (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'caveman look-alikes '));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const ext = path.join(dir, '.vscode', 'extensions');
+  for (const name of ['someone.continue-on-save-1.0.0', 'someone.augmented-reality-0.2.0']) fs.mkdirSync(path.join(ext, name), { recursive: true });
+  const preload = path.join(dir, 'hide-system-apps.cjs');
+  fs.writeFileSync(preload, `const fs = require('fs'); const exists = fs.existsSync; fs.existsSync = p => String(p).startsWith('/Applications/') ? false : exists(p);`);
+  const env = isolatedEnv(dir);
+  Object.assign(env, { XDG_CONFIG_HOME: dir });
+  const run = () => {
+    const result = spawnSync(process.execPath, ['--require', preload, INSTALLER, '--minimal', '--dry-run', '--non-interactive'], {
+      encoding: 'utf8', cwd: dir, env,
+    });
+    assert.equal(result.status, 0, result.stdout + result.stderr);
+    return result.stdout;
+  };
+  assert.doesNotMatch(run(), /(Continue|Augment Code) detected/);
+
+  fs.mkdirSync(path.join(ext, 'continue.continue-1.2.10-darwin-arm64'));
+  fs.mkdirSync(path.join(ext, 'augment.vscode-augment-0.500.0'));
+  const found = run();
+  assert.match(found, /Continue detected/);
+  assert.match(found, /Augment Code detected/);
 });

@@ -20,7 +20,7 @@ const mcpStub = join(here, "fixtures", "stub-caveman-mcp.mjs");
 const stubProviderExtension = join(here, "fixtures", "stub-provider-extension.mjs");
 const havePi = existsSync(piCli);
 
-function startStub() {
+function startStub({ instanceToken = "test-token", healthRedirect } = {}) {
   const requests = [];
   const server = createServer((req, res) => {
     let body = "";
@@ -28,7 +28,8 @@ function startStub() {
     req.on("end", () => {
       requests.push({ method: req.method, path: req.url, body });
       if (req.method === "GET" && req.url === "/health/live") {
-        res.writeHead(200, { "content-type": "application/json" });
+        if (healthRedirect) { res.writeHead(302, { location: healthRedirect }); res.end(); return; }
+        res.writeHead(200, { "content-type": "application/json", ...(instanceToken ? { "x-caveman-instance": instanceToken } : {}) });
         res.end("{}");
         return;
       }
@@ -99,11 +100,14 @@ process.stdin.unref();
       started_at: new Date().toISOString(),
       version: "test",
       recovery_via_mcp: recoveryViaMcp,
+      provider_upstreams: { openai: "http://127.0.0.1:1/native-openai" },
+      compat_upstreams: { "stub-relay": "http://127.0.0.1:1", "opencode-go": "http://127.0.0.1:1/tenant-go" },
     }));
   }
   const env = {
     ...process.env,
     HOME: home,
+    USERPROFILE: home,
     CAVEMAN_HOME: cavemanHome,
     CAVE_GATEWAY_URL: `http://127.0.0.1:${port}`,
     CAVEMAN_PI_HOOK_CMD: JSON.stringify([process.execPath, hook, "placeholder"]),
@@ -134,48 +138,122 @@ function runPi(env, args) {
   });
 }
 
-// Drives the BUILT extension directly (no pi CLI needed): the tool_result
-// handler used to shrink every tool including caveman_retrieve's own output.
-// The proxy files that output as an ObjectCommandResult and masks anything past
-// ~448 bytes, so the recovered original came back to the model as a fresh ccr://
-// mask and recovery looped instead of terminating — and registering the tool
-// disables the proxy's server-side retrieve loop, so nothing else strips it.
-test("caveman_retrieve output is never shrunk; other tools still are", async () => {
-  const root = mkdtempSync(join(tmpdir(), "cave-pi-shrink-"));
-  const hookLog = join(root, "hooks.log");
-  const hook = join(root, "hook.mjs");
+// A session-scoped harness over the BUILT extension (no pi CLI needed).
+// `activeTools` models the set Pi declares to the model for this session; the
+// other two shapes model a host that cannot answer the question at all.
+async function shrinkHarness({ activeTools = ["read_file", "caveman_retrieve"], omitGetActiveTools = false, activeToolsThrows = false } = {}) {
+  const fx = fixture(0, { runState: false });
+  const hook = join(fx.root, "publish.mjs");
+  const store = join(fx.root, "originals.json");
   writeFileSync(hook, `
-import { appendFileSync } from "node:fs";
-const event = process.argv[process.argv.length - 1];
+import { createHash } from "node:crypto";
+import { writeFileSync } from "node:fs";
 let input = "";
 process.stdin.setEncoding("utf8");
 process.stdin.on("data", (chunk) => { input += chunk; });
 process.stdin.on("end", () => {
-  let toolName = "";
-  try { toolName = JSON.parse(input).tool_name ?? ""; } catch { /* logged as empty */ }
-  appendFileSync(${JSON.stringify(hookLog)}, event + " " + toolName + "\\n");
-  process.stdout.write('{"output_replacement":"SHRUNK <<ccr:handle>>"}');
+  const text = JSON.parse(input).tool_output;
+  if (typeof text !== "string") { process.stdout.write("{}"); return; }
+  const handle = "ccr_obj_" + createHash("sha256").update(text).digest("hex").slice(0, 32);
+  writeFileSync(${JSON.stringify(store)}, JSON.stringify({ [handle]: text }));
+  const recovery_ref = "ccr://" + handle;
+  process.stdout.write(JSON.stringify({ recovery_ref, output_replacement: "SHRUNK full: " + recovery_ref }));
 });
 `);
-  const prior = process.env.CAVEMAN_PI_HOOK_CMD;
-  process.env.CAVEMAN_PI_HOOK_CMD = JSON.stringify([process.execPath, hook, "placeholder"]);
-  try {
-    const { default: factory } = await import(pathToFileURL(extension).href);
-    const handlers = new Map();
-    factory({ registerTool: () => {}, on: (name, fn) => handlers.set(name, fn) });
-    const result = (toolName) => handlers.get("tool_result")({ toolName, input: {}, isError: false, content: [{ type: "text", text: "exact original bytes" }] });
+  const vars = {
+    CAVEMAN_PI_HOOK_CMD: JSON.stringify([process.execPath, hook, "placeholder"]),
+    CAVEMAN_MCP_BIN: fx.env.CAVEMAN_MCP_BIN,
+    STUB_MCP_STORE: store,
+  };
+  const prior = Object.fromEntries(Object.keys(vars).map((key) => [key, process.env[key]]));
+  Object.assign(process.env, vars);
+  const handlers = new Map();
+  let retrieveTool;
+  const pi = { registerTool: (tool) => { retrieveTool = tool; }, on: (name, fn) => handlers.set(name, fn) };
+  if (activeToolsThrows) pi.getActiveTools = () => { throw new Error("host cannot answer"); };
+  else if (!omitGetActiveTools) pi.getActiveTools = () => activeTools;
+  const { default: factory } = await import(pathToFileURL(extension).href);
+  factory(pi);
+  // Hosts deliver tool results only inside a started session.
+  await handlers.get("session_start")?.({}, { hasUI: false, ui: { notify() {} }, sessionManager: { getSessionId: () => "test" } });
+  return {
+    fx,
+    store,
+    handlers,
+    get retrieveTool() { return retrieveTool; },
+    async cleanup() {
+      await handlers.get("session_shutdown")?.();
+      for (const [key, value] of Object.entries(prior)) {
+        if (value === undefined) delete process.env[key]; else process.env[key] = value;
+      }
+      fx.cleanup();
+    },
+  };
+}
 
-    const shrunk = await result("read_file");
-    assert.equal(shrunk?.content?.[0]?.text, "SHRUNK <<ccr:handle>>", "ordinary tool output must still shrink");
-    assert.equal(await result("caveman_retrieve"), undefined, "recovered originals must reach the model unmasked");
-    // Not merely unchanged output: the runtime is never even asked, so no
-    // handle can be minted for bytes that were already recovered.
-    assert.deepEqual(readFileSync(hookLog, "utf8").trim().split("\n"), ["PostToolUse read_file"]);
+// The tool_result handler used to shrink every tool including caveman_retrieve's
+// own output. The proxy files that output as an ObjectCommandResult and masks
+// anything past ~448 bytes, so the recovered original came back to the model as a
+// fresh ccr:// mask and recovery looped instead of terminating — and registering
+// the tool disables the proxy's server-side retrieve loop, so nothing else strips it.
+test("fresh tool-output handles recover exactly; caveman_retrieve output is never shrunk", async () => {
+  const original = "exact original bytes\r\nline two éø bytes\0\n";
+  const h = await shrinkHarness();
+  try {
+    const image = { type: "image", data: "cGl4ZWxz", mimeType: "image/png" };
+    const content = [{ type: "text", text: original.slice(0, 8) }, image, { type: "text", text: original.slice(8) }];
+    const shrunk = await h.handlers.get("tool_result")({ toolName: "read_file", input: {}, isError: false, content });
+    const handle = Object.keys(JSON.parse(readFileSync(h.store, "utf8")))[0];
+    assert.deepEqual(shrunk?.content, [{ type: "text", text: `SHRUNK full: ccr://${handle}` }, image]);
+    assert.equal(shrunk.content[1], image, "nontext content must survive unchanged");
+
+    const recovered = await h.retrieveTool.execute("recover", { recovery_handle: `ccr://${handle}` }, undefined);
+    assert.deepEqual(recovered.content, [{ type: "text", text: original }], "verification must not consume model recovery");
+    assert.equal(await h.handlers.get("tool_result")({ toolName: "caveman_retrieve", input: {}, isError: false, content: recovered.content }), undefined);
   } finally {
-    if (prior === undefined) delete process.env.CAVEMAN_PI_HOOK_CMD; else process.env.CAVEMAN_PI_HOOK_CMD = prior;
-    rmSync(root, { recursive: true, force: true });
+    await h.cleanup();
   }
 });
+
+// #1211: a shrink hands the model a ccr:// handle plus an instruction to call
+// caveman_retrieve. A session whose active tool set omits that tool — `pi --tools
+// read,bash`, or a subagent with its own `tools:` list — cannot follow that
+// instruction, so the shrink destroys the output instead of compressing it. The
+// reporter's documentation-review subagent saw every read/bash result as an
+// unrecoverable placeholder.
+test("#1211: a session whose active tools omit caveman_retrieve is never shrunk", async () => {
+  const h = await shrinkHarness({ activeTools: ["read", "bash"] });
+  try {
+    const content = [{ type: "text", text: "x".repeat(4096) }];
+    assert.equal(
+      await h.handlers.get("tool_result")({ toolName: "bash", input: {}, isError: false, content }),
+      undefined,
+      "a session that cannot call caveman_retrieve must keep its original tool output",
+    );
+    // The gate runs before PostToolUse, so no handle is published either.
+    assert.equal(existsSync(h.store), false, "no recovery handle may be published for an unrecoverable session");
+  } finally {
+    await h.cleanup();
+  }
+});
+
+// Fail CLOSED when the host cannot answer: skipping the shrink costs this turn's
+// compression, while shrinking without recovery loses the output for good.
+for (const [label, options] of [
+  ["a host that does not implement getActiveTools", { omitGetActiveTools: true }],
+  ["a host whose getActiveTools throws", { activeToolsThrows: true }],
+]) {
+  test(`#1211: ${label} is treated as unrecoverable`, async () => {
+    const h = await shrinkHarness(options);
+    try {
+      const content = [{ type: "text", text: "y".repeat(4096) }];
+      assert.equal(await h.handlers.get("tool_result")({ toolName: "bash", input: {}, isError: false, content }), undefined);
+      assert.equal(existsSync(h.store), false, "an unanswerable active-tool set must not publish a handle");
+    } finally {
+      await h.cleanup();
+    }
+  });
+}
 
 test("open gate: first request routes through /w/pi with Core in the system prompt", { skip: !havePi && "pi devDependency missing" }, async () => {
   const { server, requests, port } = await startStub();
@@ -184,7 +262,7 @@ test("open gate: first request routes through /w/pi with Core in the system prom
     const out = await runPi(fx.env, [
       "--extension", stubProviderExtension, "--extension", extension,
       "--no-session", "--no-skills", "--no-context-files", "--no-prompt-templates", "--no-themes", "--no-extensions",
-      "--provider", "stubprov", "--model", "stub-model",
+      "--provider", "openai", "--model", "stub-model",
       "-p", "say hi",
     ]);
     assert.match(out.stdout, /CAVEMAN_STUB_OK/, `stdout: ${out.stdout}\nstderr: ${out.stderr}`);
@@ -202,6 +280,73 @@ test("open gate: first request routes through /w/pi with Core in the system prom
   }
 });
 
+// The CLI keeps its config in $CAVEMAN_HOME/cloud.json; the pre-v4
+// ~/.caveman-cloud/config.json no longer decides the gateway once that exists.
+test("open gate: the gateway comes from $CAVEMAN_HOME/cloud.json, not the old config", { skip: !havePi && "pi devDependency missing" }, async () => {
+  const { server, requests, port } = await startStub();
+  const fx = fixture(port);
+  try {
+    delete fx.env.CAVE_GATEWAY_URL;
+    writeFileSync(join(fx.env.CAVEMAN_HOME, "cloud.json"), JSON.stringify({ gatewayUrl: `http://127.0.0.1:${port}`, managedGateway: true }));
+    mkdirSync(join(fx.env.HOME, ".caveman-cloud"), { recursive: true });
+    writeFileSync(join(fx.env.HOME, ".caveman-cloud", "config.json"), JSON.stringify({ gatewayUrl: "http://127.0.0.1:1", managedGateway: true }));
+    const out = await runPi(fx.env, [
+      "--extension", stubProviderExtension, "--extension", extension,
+      "--no-session", "--no-skills", "--no-context-files", "--no-prompt-templates", "--no-themes", "--no-extensions",
+      "--provider", "openai", "--model", "stub-model",
+      "-p", "say hi",
+    ]);
+    assert.match(out.stdout, /CAVEMAN_STUB_OK/, `stdout: ${out.stdout}\nstderr: ${out.stderr}`);
+    assert.equal(requests.filter((r) => r.method === "POST")[0]?.path, "/w/pi/openai/v1/chat/completions");
+  } finally {
+    fx.cleanup();
+    server.close();
+  }
+});
+
+// Setup moves the local runtime off a busy 8787 and records localPort in
+// cloud.json; plain `pi` has to follow it, as the CLI does.
+test("open gate: the local runtime's port comes from cloud.json localPort", { skip: !havePi && "pi devDependency missing" }, async () => {
+  const { server, requests, port } = await startStub();
+  const fx = fixture(port);
+  try {
+    delete fx.env.CAVE_GATEWAY_URL;
+    writeFileSync(join(fx.env.CAVEMAN_HOME, "cloud.json"), JSON.stringify({ localPort: port }));
+    const out = await runPi(fx.env, [
+      "--extension", stubProviderExtension, "--extension", extension,
+      "--no-session", "--no-skills", "--no-context-files", "--no-prompt-templates", "--no-themes", "--no-extensions",
+      "--provider", "openai", "--model", "stub-model",
+      "-p", "say hi",
+    ]);
+    assert.match(out.stdout, /CAVEMAN_STUB_OK/, `stdout: ${out.stdout}\nstderr: ${out.stderr}`);
+    assert.equal(requests.filter((r) => r.method === "POST")[0]?.path, "/w/pi/openai/v1/chat/completions");
+  } finally {
+    fx.cleanup();
+    server.close();
+  }
+});
+
+// Signing in stores the Cloud's gateway for Cloud calls only: without an
+// explicit choice (managedGateway) pi never sends traffic there.
+test("a gatewayUrl stored by login alone is not pi's gateway", { skip: !havePi && "pi devDependency missing" }, async () => {
+  const { server, requests, port } = await startStub();
+  const fx = fixture(port);
+  try {
+    delete fx.env.CAVE_GATEWAY_URL;
+    writeFileSync(join(fx.env.CAVEMAN_HOME, "cloud.json"), JSON.stringify({ gatewayUrl: `http://127.0.0.1:${port}` }));
+    await runPi(fx.env, [
+      "--extension", stubProviderExtension, "--extension", extension,
+      "--no-session", "--no-skills", "--no-context-files", "--no-prompt-templates", "--no-themes", "--no-extensions",
+      "--provider", "openai", "--model", "stub-model",
+      "-p", "say hi",
+    ]);
+    assert.equal(requests.filter((r) => r.method === "POST" && r.path.startsWith("/w/pi/")).length, 0, `requests: ${JSON.stringify(requests)}`);
+  } finally {
+    fx.cleanup();
+    server.close();
+  }
+});
+
 test("closed gate (no run-state): zero proxy requests and a visible direct-mode notice", { skip: !havePi && "pi devDependency missing" }, async () => {
   const { server, requests, port } = await startStub();
   const fx = fixture(port, { runState: false });
@@ -209,11 +354,12 @@ test("closed gate (no run-state): zero proxy requests and a visible direct-mode 
     const out = await runPi(fx.env, [
       "--extension", stubProviderExtension, "--extension", extension,
       "--no-session", "--no-skills", "--no-context-files", "--no-prompt-templates", "--no-themes", "--no-extensions",
-      "--provider", "stubprov", "--model", "stub-model",
+      "--provider", "anthropic", "--model", "stub-local",
       "-p", "say hi",
     ]);
-    // Direct mode points at the dead loopback port the stub provider declares —
-    // the call fast-fails locally; what matters is honesty and zero routed traffic.
+    // Direct mode points at the dead loopback port of the "anthropic" stub
+    // provider. The call fast-fails locally. What matters is honesty and zero
+    // routed traffic.
     const providerHits = requests.filter((r) => r.method === "POST");
     assert.equal(providerHits.length, 0, `gate closed but stub saw: ${JSON.stringify(providerHits)}`);
     assert.match(out.stderr + out.stdout, /direct mode, no compression/, `stderr: ${out.stderr}`);
@@ -230,7 +376,7 @@ test("published recovery=false: gate refuses even with a live proxy and working 
     const out = await runPi(fx.env, [
       "--extension", stubProviderExtension, "--extension", extension,
       "--no-session", "--no-skills", "--no-context-files", "--no-prompt-templates", "--no-themes", "--no-extensions",
-      "--provider", "stubprov", "--model", "stub-model",
+      "--provider", "anthropic", "--model", "stub-local",
       "-p", "say hi",
     ]);
     // Proxy is alive (health probe hits the stub) but published recovery is
@@ -243,3 +389,109 @@ test("published recovery=false: gate refuses even with a live proxy and working 
     server.close();
   }
 });
+
+// The seam of #946: the extension route string, the /w/pi prefix strip in the
+// proxy, and the built-in compat mount name are three separate literals. This
+// test drives an opencode-go model through the stub gateway and asserts the
+// path that the proxy must accept.
+test("open gate: opencode-go routes through the compat mount", { skip: !havePi && "pi devDependency missing" }, async () => {
+  const { server, requests, port } = await startStub();
+  const fx = fixture(port);
+  try {
+    const out = await runPi(fx.env, [
+      "--extension", stubProviderExtension, "--extension", extension,
+      "--no-session", "--no-skills", "--no-context-files", "--no-prompt-templates", "--no-themes", "--no-extensions",
+      "--provider", "opencode-go", "--model", "stub-go-model",
+      "-p", "say hi",
+    ]);
+    assert.match(out.stdout, /CAVEMAN_STUB_OK/, `stdout: ${out.stdout}\nstderr: ${out.stderr}`);
+    const providerHits = requests.filter((r) => r.method === "POST");
+    assert.ok(providerHits.length >= 1, `no provider request reached the stub; all: ${JSON.stringify(requests)}`);
+    assert.equal(providerHits[0].path, "/w/pi/compat/opencode-go/v1/chat/completions");
+  } finally {
+    fx.cleanup();
+    server.close();
+  }
+});
+
+// A provider with an allowlisted name but a custom endpoint (a local relay, or
+// Azure under the name "openai") must stay direct. The stub "anthropic" provider
+// points at a dead loopback port, so the direct call fast-fails and nothing
+// leaves the machine.
+test("open gate: a provider with a custom endpoint stays direct with a notice", { skip: !havePi && "pi devDependency missing" }, async () => {
+  const { server, requests, port } = await startStub();
+  const fx = fixture(port);
+  try {
+    const out = await runPi(fx.env, [
+      "--extension", stubProviderExtension, "--extension", extension,
+      "--no-session", "--no-skills", "--no-context-files", "--no-prompt-templates", "--no-themes", "--no-extensions",
+      "--provider", "anthropic", "--model", "stub-local",
+      "-p", "say hi",
+    ]);
+    const providerHits = requests.filter((r) => r.method === "POST");
+    assert.equal(providerHits.length, 0, `custom endpoint was routed: ${JSON.stringify(providerHits)}`);
+    assert.match(out.stderr + out.stdout, /pass-through for anthropic\/stub-local \(provider endpoint 127\.0\.0\.1:1 is not api\.anthropic\.com\)/, `stderr: ${out.stderr}`);
+  } finally {
+    fx.cleanup();
+    server.close();
+  }
+});
+
+// A custom-named provider routes only when the running proxy published a compat
+// mount with that exact name. The stub gateway answers the routed request, so
+// the dead loopback endpoint of the provider is never reached.
+test("open gate: a published compat mount routes a custom provider", { skip: !havePi && "pi devDependency missing" }, async () => {
+  const { server, requests, port } = await startStub();
+  const fx = fixture(port);
+  try {
+    const out = await runPi(fx.env, [
+      "--extension", stubProviderExtension, "--extension", extension,
+      "--no-session", "--no-skills", "--no-context-files", "--no-prompt-templates", "--no-themes", "--no-extensions",
+      "--provider", "stub-relay", "--model", "stub-relay-model",
+      "-p", "say hi",
+    ]);
+    assert.match(out.stdout, /CAVEMAN_STUB_OK/, `stdout: ${out.stdout}\nstderr: ${out.stderr}`);
+    const providerHits = requests.filter((r) => r.method === "POST");
+    assert.ok(providerHits.length >= 1, `no provider request reached the stub; all: ${JSON.stringify(requests)}`);
+    assert.equal(providerHits[0].path, "/w/pi/compat/stub-relay/v1/chat/completions");
+  } finally {
+    fx.cleanup();
+    server.close();
+  }
+});
+
+// Same endpoint, no published mount: direct, with a notice naming the fix.
+test("open gate: a custom provider with no compat mount stays direct and says why", { skip: !havePi && "pi devDependency missing" }, async () => {
+  const { server, requests, port } = await startStub();
+  const fx = fixture(port);
+  try {
+    const out = await runPi(fx.env, [
+      "--extension", stubProviderExtension, "--extension", extension,
+      "--no-session", "--no-skills", "--no-context-files", "--no-prompt-templates", "--no-themes", "--no-extensions",
+      "--provider", "unlisted-relay", "--model", "stub-unlisted-model",
+      "-p", "say hi",
+    ]);
+    const providerHits = requests.filter((r) => r.method === "POST");
+    assert.equal(providerHits.length, 0, `unmounted provider was routed: ${JSON.stringify(providerHits)}`);
+    assert.match(out.stderr + out.stdout, /no compat mount named "unlisted-relay" in the local proxy; add compat\.unlisted-relay\.base_url to caveman\.yaml/, `stderr: ${out.stderr}`);
+  } finally {
+    fx.cleanup();
+    server.close();
+  }
+});
+
+for (const instanceToken of [undefined, 'another-listener-token']) {
+  test(`stale run state cannot route credentials to listener with ${instanceToken ? 'wrong' : 'missing'} identity`, { skip: !havePi && 'pi devDependency missing' }, async () => {
+    const { server, requests, port } = await startStub({ instanceToken: instanceToken ?? '' });
+    const fx = fixture(port);
+    try {
+      const out = await runPi(fx.env, [
+        '--extension', stubProviderExtension, '--extension', extension,
+        '--no-session', '--no-skills', '--no-context-files', '--no-prompt-templates', '--no-themes', '--no-extensions',
+        '--provider', 'openai', '--model', 'stub-model', '-p', 'say hi',
+      ]);
+      assert.equal(requests.filter(r => r.method === 'POST').length, 0);
+      assert.match(out.stderr + out.stdout, /local proxy not running/);
+    } finally { fx.cleanup(); server.close(); }
+  });
+}

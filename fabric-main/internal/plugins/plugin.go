@@ -1,6 +1,7 @@
 package plugins
 
 import (
+	"bufio"
 	"bytes"
 	"fmt"
 	"os"
@@ -114,8 +115,7 @@ func (o *PluginBase) Setup() (err error) {
 		return
 	}
 
-	// After Setup, run ConfigureCustom if present, but skip re-validation
-	// since Ask() already validated user input (or allowed explicit reset)
+	// After Setup, do not re-validate the user input. Ask() validates input and allows explicit reset.
 	if o.ConfigureCustom != nil {
 		err = o.ConfigureCustom()
 	}
@@ -145,8 +145,6 @@ func NewSetting(envVariable string, required bool) *Setting {
 		Required:    required,
 	}
 }
-
-// In plugins/plugin.go
 
 type Setting struct {
 	EnvVariable string
@@ -225,9 +223,7 @@ func (o *SetupQuestion) Ask(label string) (err error) {
 	} else {
 		fmt.Printf(i18n.T("plugin_question_optional"), prefix, o.Question)
 	}
-	var answer string
-	fmt.Scanln(&answer)
-	answer = strings.TrimRight(answer, "\n")
+	answer, _ := readLine()
 	isReset := strings.ToLower(answer) == AnswerReset
 	if answer == "" {
 		answer = o.Value
@@ -261,8 +257,7 @@ func (o *SetupQuestion) OnAnswerWithReset(answer string, isReset bool) (err erro
 			return
 		}
 	}
-	// Skip validation when explicitly resetting a value - the user intentionally
-	// wants to clear the value even if it's required
+	// Do not validate when the user explicitly resets a required value.
 	if isReset {
 		return nil
 	}
@@ -346,5 +341,51 @@ func BuildEnvVariable(name string) string {
 	name = strings.ToUpper(name)
 	name = strings.ReplaceAll(name, " ", "_")
 	name = strings.ReplaceAll(name, "-", "_")
+	name = strings.ReplaceAll(name, ".", "_")
 	return name
+}
+
+// stdinReader is shared between prompts. A bufio.Reader reads ahead, so a
+// reader created for every question would drop the rest of the buffered input,
+// which breaks scripted answers such as `printf 'a\nb\n' | fabric --setup`.
+// The reader is rebuilt when os.Stdin changes, which keeps redirected input
+// working for callers that swap the file.
+var (
+	stdinReader *bufio.Reader
+	stdinSource *os.File
+)
+
+func stdinLineReader() *bufio.Reader {
+	if stdinReader == nil || stdinSource != os.Stdin {
+		stdinReader = bufio.NewReader(os.Stdin)
+		stdinSource = os.Stdin
+	}
+	return stdinReader
+}
+
+// readLine reads a single line from stdin and accepts either \n or \r as the
+// line ending. Terminals such as kitty on macOS send a bare \r when Enter is
+// pressed, and fmt.Scanln waited for a \n that never arrived.
+func readLine() (string, error) {
+	reader := stdinLineReader()
+
+	var line []rune
+	for {
+		ch, _, err := reader.ReadRune()
+		if err != nil {
+			return string(line), err
+		}
+		switch ch {
+		case '\n':
+			return string(line), nil
+		case '\r':
+			// Drop the \n of a \r\n ending so it is not read as an empty
+			// answer at the next prompt.
+			if next, _, err := reader.ReadRune(); err == nil && next != '\n' {
+				_ = reader.UnreadRune()
+			}
+			return string(line), nil
+		}
+		line = append(line, ch)
+	}
 }

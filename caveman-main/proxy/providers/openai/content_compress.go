@@ -125,6 +125,11 @@ func ExtractStabilizable(body []byte, meta providers.RequestMetadata) ([]provide
 // (per-message parse problems are skipped, not failed), which is what makes the
 // skip safe.
 func rewritableZones(body []byte, meta providers.RequestMetadata, liveOnly bool) ([]zoneCandidate, bool) {
+	// Counting must measure the caller's exact prompt. Neither live compression
+	// nor reuse of a previously compressed prefix may alter an accounting call.
+	if isInputTokenCountEndpoint(meta.Endpoint) {
+		return nil, false
+	}
 	root, ok := rootObjectSpan(body)
 	if !ok {
 		return nil, false
@@ -236,10 +241,19 @@ func responsesZones(body []byte, root jsonSpan, liveOnly bool) ([]zoneCandidate,
 				continue
 			}
 			output, found := findObjectField(body, item, "output")
-			if !found || !isJSONString(body, output) {
+			if !found {
 				continue
 			}
-			collectStringCandidate(body, output, &candidates, true)
+			// Codex 0.149+ sends custom_tool_call_output.output as an ARRAY of
+			// {"type":"input_text","text":...} parts (the shell result split into a
+			// header part and the body part), not a string. Treating only the
+			// string form as a candidate left the live zone empty for every
+			// tool turn, so nothing compressed on real Codex traffic.
+			if isJSONString(body, output) {
+				collectStringCandidate(body, output, &candidates, true)
+			} else {
+				candidates = collectResponsesOutputParts(body, output)
+			}
 		case role == "user":
 			candidates = collectResponsesContent(body, item)
 		default:
@@ -324,6 +338,31 @@ func collectResponsesContent(body []byte, item jsonSpan) []spliceCandidate {
 		}
 		if text, found := findObjectField(body, part, "text"); found && isJSONString(body, text) {
 			collectStringCandidate(body, text, &candidates, false)
+		}
+	}
+	return candidates
+}
+
+// collectResponsesOutputParts collects the text parts of an array-shaped tool
+// output: [{"type":"input_text","text":...}, ...]. Same part types as a user
+// message's content array; forced TOON is allowed because the bytes are tool
+// output, exactly like the string form.
+func collectResponsesOutputParts(body []byte, output jsonSpan) []spliceCandidate {
+	if output.start >= output.end || body[output.start] != '[' {
+		return nil
+	}
+	parts, ok := arrayElements(body, output)
+	if !ok {
+		return nil
+	}
+	var candidates []spliceCandidate
+	for _, part := range parts {
+		typ, _ := objectStringField(body, part, "type")
+		if typ != "input_text" && typ != "text" && typ != "output_text" {
+			continue
+		}
+		if text, found := findObjectField(body, part, "text"); found && isJSONString(body, text) {
+			collectStringCandidate(body, text, &candidates, true)
 		}
 	}
 	return candidates

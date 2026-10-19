@@ -310,7 +310,12 @@ export type SpanOptions = {
   outputTokens?: number;
   /** Provider-reported cached-input subset; never added to inputTokens. */
   cachedTokens?: number;
-  /** Provider-reported/request-attributed cost in USD. */
+  /** Provider-reported cache-write input tokens (`gen_ai.usage.cache_creation.input_tokens`). Never clamped to
+   * inputTokens: Anthropic reports cache writes outside input_tokens. When absent, a caller-supplied attribute of the
+   * same name passes through. */
+  cacheCreationTokens?: number;
+  /** Provider-reported/request-attributed cost in USD, exported as `caveman.usage.cost_usd` plus the deprecated
+   * non-semconv `gen_ai.usage.cost_usd` (kept through 1.x). */
   costUsd?: number;
   workflow?: string;
   status?: "unset" | "ok" | "error";
@@ -1111,7 +1116,10 @@ export class RuntimePolicyClient {
       delete requestHeaders["content-type"];
       const init: RequestInit = { method: "GET", headers: requestHeaders };
       const response = await caveFetch(this.cave, `${this.cave.options.baseURL}/sdk/v1/runtime-policy`, init);
-      if (!response.ok) return this.refreshFailed(`runtime policy fetch failed (HTTP ${response.status})`);
+      if (!response.ok) {
+        discardResponse(response);
+        return this.refreshFailed(`runtime policy fetch failed (HTTP ${response.status})`);
+      }
 
       let payload: unknown;
       try {
@@ -1498,7 +1506,7 @@ function normalizeExperiment(raw: unknown): NormalizedExperiment | null {
 
 /**
  * The deterministic unit fraction in [0,1) used for experiment assignment,
- * byte-for-byte the Go `shared/platform/sampling.Fraction`: SHA-256 over each
+ * byte-for-byte the Go Caveman-Cloud `shared/platform/sampling.Fraction`: SHA-256 over each
  * key prefixed by its 8-byte big-endian UTF-8 byte length, first 8 digest bytes
  * as a big-endian uint64, shifted right 11 and divided by 2^53.
  *
@@ -1602,7 +1610,10 @@ async function toolSearch(
     headers: headers(cave, workflow),
     body: JSON.stringify(body)
   });
-	if (!response.ok) throw new Error(`tool search failed with HTTP ${response.status}`);
+  if (!response.ok) {
+    discardResponse(response);
+    throw new Error(`tool search failed with HTTP ${response.status}`);
+  }
   const data = await response.json();
 
   // Map snake_case response to camelCase
@@ -1670,7 +1681,10 @@ async function compress(cave: Cave, payload: string, options?: CompressOptions):
       headers: headers(cave, workflow),
       body: JSON.stringify(body)
     });
-    if (!response.ok) return passthrough();
+    if (!response.ok) {
+      discardResponse(response);
+      return passthrough();
+    }
     data = await response.json();
   } catch {
     return passthrough();
@@ -1750,7 +1764,10 @@ async function contextPack(
       headers: headers(cave, cave.options.defaultWorkflow ?? "unlabeled-workflow"),
       body: JSON.stringify({ query, items: wireItems, options: wireOptions })
     });
-    if (!response.ok) return passthrough();
+    if (!response.ok) {
+      discardResponse(response);
+      return passthrough();
+    }
     data = await response.json();
   } catch {
     return passthrough();
@@ -1957,7 +1974,10 @@ async function cavePlan(cave: Cave): Promise<CavePlan> {
     method: "GET",
     headers: otlpHeaders(cave)
   });
-  if (!response.ok) throw new Error(`cave plan fetch failed with HTTP ${response.status}`);
+  if (!response.ok) {
+    discardResponse(response);
+    throw new Error(`cave plan fetch failed with HTTP ${response.status}`);
+  }
   // Passed through verbatim: snake_case wire fields, every figure inferred/per-day.
   return (await response.json()) as CavePlan;
 }
@@ -1981,8 +2001,56 @@ async function caveFetch(cave: Cave, input: RequestInfo | URL, init: RequestInit
   const inputSignal = input instanceof Request ? input.signal : undefined;
   const signals = [timeout, cave.options.signal, inputSignal, init.signal].filter((signal): signal is AbortSignal => signal !== undefined && signal !== null);
   const signal = signals.length === 1 ? signals[0]! : AbortSignal.any(signals);
+  // API and upstream credentials are scoped to this gateway. Fetch only strips
+  // standard Authorization on cross-origin redirects, not x-cave-upstream-key
+  // or the OTLP x-cave-api-key header. Raw callers cannot override this policy.
+  const response = await withRequestAbort(fetch(input, { ...init, redirect: "error", signal }), signal, timeoutMs);
+  if (!(response instanceof Response) || response.body === null) {
+    // Fetch-compatible adapters sometimes expose decoder methods without a Web
+    // stream. Their body reads still share the original request's deadline.
+    return new Proxy(response, {
+      get(target, property) {
+        const value: unknown = Reflect.get(target, property, target);
+        if (typeof value !== "function") return value;
+        if (["json", "text", "arrayBuffer", "blob", "formData"].includes(String(property))) {
+          return (...args: unknown[]) => withRequestAbort(Promise.resolve().then(() => Reflect.apply(value, target, args)), signal, timeoutMs);
+        }
+        return value.bind(target);
+      }
+    });
+  }
+  // A fetch promise settles at headers. Pipe the body through the same abort
+  // signal so custom fetches cannot strand decoders or raw stream readers after
+  // returning a Response. Web streams propagate abort/cancel to the source.
+  const stream = new TransformStream<Uint8Array, Uint8Array>();
+  void withRequestAbort(response.body.pipeTo(stream.writable, { signal }), signal, timeoutMs).catch(() => {});
+  return responseMetadata(new Response(stream.readable, {
+    status: response.status,
+    statusText: response.statusText,
+    headers: response.headers,
+  }), response);
+}
+
+function discardResponse(response: Response): void {
+  // Callers that use only the status must release the stream and its deadline.
+  void response.body?.cancel().catch(() => {});
+}
+
+function responseMetadata(response: Response, original: Response): Response {
+  const clone = response.clone.bind(response);
+  Object.defineProperties(response, {
+    url: { value: original.url },
+    type: { value: original.type },
+    redirected: { value: original.redirected },
+    clone: { value: () => responseMetadata(clone(), original) },
+  });
+  return response;
+}
+
+async function withRequestAbort<T>(pending: Promise<T>, signal: AbortSignal, timeoutMs: number): Promise<T> {
+  let fail: () => void;
   const abort = new Promise<never>((_resolve, reject) => {
-    const fail = () => {
+    fail = () => {
       const reason = signal.reason;
       reject(reason instanceof DOMException && reason.name === "TimeoutError"
         ? new Error("cave_request_timeout")
@@ -1997,9 +2065,10 @@ async function caveFetch(cave: Cave, input: RequestInfo | URL, init: RequestInit
   // deadline always gets its chance to settle.
   const keepAlive = setTimeout(() => {}, timeoutMs);
   try {
-    return await Promise.race([fetch(input, { ...init, signal }), abort]);
+    return await Promise.race([pending, abort]);
   } finally {
     clearTimeout(keepAlive);
+    signal.removeEventListener("abort", fail!);
   }
 }
 
@@ -2054,7 +2123,10 @@ async function request(cave: Cave, path: string, body?: unknown, workflow?: stri
   };
   if (body !== undefined) init.body = JSON.stringify(body);
   const response = await caveFetch(cave, `${cave.options.baseURL}${path}`, init);
-  if (!response.ok) throw new CaveRequestError(response.status, path, `cave request failed (${response.status})`);
+  if (!response.ok) {
+    discardResponse(response);
+    throw new CaveRequestError(response.status, path, `cave request failed (${response.status})`);
+  }
   let decoded: unknown;
   try {
     if (typeof response.text === "function") {
@@ -2080,7 +2152,10 @@ async function artifactGet(cave: Cave, artifactId: string, workflow: string, tra
     method: "GET",
     headers: headers(cave, workflow, undefined, undefined, trace)
   });
-  if (!response.ok) throw new CaveRequestError(response.status, path, `cave request failed (${response.status})`);
+  if (!response.ok) {
+    discardResponse(response);
+    throw new CaveRequestError(response.status, path, `cave request failed (${response.status})`);
+  }
   try {
     return JSON.parse(await response.text());
   } catch {
@@ -2158,9 +2233,12 @@ export class OTelExporter {
       "gen_ai.usage.cached_tokens",
       "gen_ai.usage.cache_read.input_tokens",
       "gen_ai.usage.cost_usd",
+      "caveman.usage.cost_usd",
       "cave.agent",
       "cave.workflow",
     ]) delete attrs[key];
+    // SDK 1.1.0 passed a caller-supplied cache-write count through; the typed field replaces it only when given.
+    if (options.cacheCreationTokens != null) delete attrs["gen_ai.usage.cache_creation.input_tokens"];
     if (options.operation !== undefined) attrs["gen_ai.operation.name"] = options.operation;
     if (options.provider !== undefined) attrs["gen_ai.provider.name"] = options.provider;
     if (options.model !== undefined) {
@@ -2171,10 +2249,15 @@ export class OTelExporter {
     const inputTokens = strictNonNegativeInt(options.inputTokens);
     const outputTokens = strictNonNegativeInt(options.outputTokens);
     const cachedTokens = strictNonNegativeInt(options.cachedTokens);
+    const cacheCreationTokens = strictNonNegativeInt(options.cacheCreationTokens);
     if (inputTokens !== null) attrs["gen_ai.usage.input_tokens"] = inputTokens;
     if (outputTokens !== null) attrs["gen_ai.usage.output_tokens"] = outputTokens;
     if (cachedTokens !== null && (inputTokens === null || cachedTokens <= inputTokens)) attrs["gen_ai.usage.cache_read.input_tokens"] = cachedTokens;
-    if (typeof options.costUsd === "number" && Number.isFinite(options.costUsd) && options.costUsd >= 0) attrs["gen_ai.usage.cost_usd"] = options.costUsd;
+    if (cacheCreationTokens !== null) attrs["gen_ai.usage.cache_creation.input_tokens"] = cacheCreationTokens;
+    if (typeof options.costUsd === "number" && Number.isFinite(options.costUsd) && options.costUsd >= 0) {
+      attrs["gen_ai.usage.cost_usd"] = options.costUsd; // deprecated: not an OTel GenAI semconv name; kept through 1.x
+      attrs["caveman.usage.cost_usd"] = options.costUsd;
+    }
     attrs["cave.agent"] = this.cave.options.agent;
     attrs["cave.workflow"] = options.workflow ?? this.cave.options.defaultWorkflow ?? "unlabeled-workflow";
 
@@ -2277,15 +2360,18 @@ function spanToOtlp(sp: OTelSpan): Record<string, unknown> {
   };
 }
 
+/** Always `doubleValue`, even for a whole number: Python exports these as floats. */
+const DOUBLE_ATTRIBUTES = new Set(["gen_ai.usage.cost_usd", "caveman.usage.cost_usd"]);
+
 /**
  * Encode one attribute as an OTLP/JSON KeyValue.
  * Ints → `intValue` (proto3 int64 → JSON string), bools → `boolValue`,
- * non-integer numbers → `doubleValue`; everything else → `stringValue`.
+ * non-integer numbers and cost → `doubleValue`; everything else → `stringValue`.
  */
 function otlpKV(key: string, value: string | number | boolean): Record<string, unknown> {
   if (typeof value === "boolean") return { key, value: { boolValue: value } };
   if (typeof value === "number") {
-    return Number.isInteger(value) ? { key, value: { intValue: String(value) } } : { key, value: { doubleValue: value } };
+    return Number.isInteger(value) && !DOUBLE_ATTRIBUTES.has(key) ? { key, value: { intValue: String(value) } } : { key, value: { doubleValue: value } };
   }
   return { key, value: { stringValue: String(value) } };
 }

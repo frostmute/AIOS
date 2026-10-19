@@ -1,9 +1,41 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { mkdirSync, writeFileSync } from "node:fs";
+import { copyFileSync, linkSync, mkdirSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { renderStatus } from "../dist/index.js";
 import { isolatedCliEnv, runCli } from "./_cli.mjs";
+import { nativeStub, nodeStub, stubEnv } from "./harness/stub-bin.mjs";
+
+function statusEnv(extra = {}) {
+  const isolated = isolatedCliEnv();
+  const { home } = isolated;
+  const bin = join(home, "bin");
+  // Do not probe installed hosts, accounts or config while checking status's
+  // output contract. A real node executable keeps POSIX/native Windows stubs
+  // launchable without adding the user's package-bin directory to PATH.
+  const node = join(bin, process.platform === "win32" ? "node.exe" : "node");
+  if (process.platform === "win32") {
+    try { linkSync(process.execPath, node); } catch { copyFileSync(process.execPath, node); }
+  } else {
+    // Keep relative library lookup valid for dynamically linked Node builds.
+    symlinkSync(process.execPath, node);
+  }
+  const noop = nativeStub(bin, "status-noop", `
+if (ARGV[0] === "version") process.stdout.write(JSON.stringify({version:"test",capabilities:["run_state","mcp_recovery"]}));
+`);
+  isolated.env = stubEnv({
+    ...(process.env.SystemRoot ? { SystemRoot: process.env.SystemRoot } : {}),
+    ...(process.env.PATHEXT ? { PATHEXT: process.env.PATHEXT } : {}),
+    PATH: "", HOME: home, USERPROFILE: home,
+    APPDATA: join(home, "AppData", "Roaming"), LOCALAPPDATA: join(home, "AppData", "Local"),
+    CAVEMAN_HOME: home, CAVE_NO_KEYCHAIN: "1", NO_COLOR: "1", CI: "1",
+    CAVEMAN_TELEMETRY: "0", CAVEMAN_OFFLINE: "1", CAVE_GATEWAY_URL: "http://127.0.0.1:9",
+    CAVEMAN_PROXY_BIN: noop, CAVEMAN_ENGINE_BIN: noop, CAVEMAN_MCP_BIN: noop,
+    CAVEMAN_BROWSE_BIN: noop, CAVEMEM_BIN: noop, CAVEMAN_SHRINK_BIN: noop,
+    ...extra,
+  }, bin);
+  return isolated;
+}
 
 const sources = { think: "global", remember: "default", execute: "project" };
 const telemetry = { state: "off", change: "caveman telemetry on|off" };
@@ -15,7 +47,7 @@ test("status observe block carries today-scoped basis, config, telemetry, and fo
     owner: "wrap",
     off_states: [{
       id: "observe",
-      line: "observe mode — compression off until you sign in (free · 1 seat · no card)",
+      line: "observe mode — compression off until you sign in (free account)",
       fix: "caveman login",
     }],
     today: {
@@ -31,13 +63,13 @@ test("status observe block carries today-scoped basis, config, telemetry, and fo
     plan: null,
     config_sources: sources,
     telemetry,
-    next: "caveman login   (free · 1 seat · no card)",
+    next: "caveman login   (free account)",
   });
   assert.match(text, /^caveman  ·  observe/m);
   assert.match(text, /41k tokens observed on the layer/);
   assert.match(text, /basis: inferred \(local counters · 812 provider_complete \/ 24 provider_partial\)/);
   assert.match(text, /~118k tokens\/day would-have-saved/);
-  assert.match(text, /telemetry  off · anonymous usage ping/);
+  assert.match(text, /telemetry  off · usage ping/);
   assert.match(text, /change: caveman telemetry on\|off/);
   assert.match(text, /next:  caveman login/);
   assert.doesNotMatch(text, /\b(?:measured|verified)\b/i);
@@ -75,7 +107,7 @@ test("status compress block omits honest unknowns instead of zeroing them", () =
 test("half-installed status lists every supplied reason and never invents local numbers", () => {
   const reasons = [
     "caveman-proxy not installed — agents still launch, traffic is NOT compressed or metered",
-    "observe mode — compression off until you sign in (free · 1 seat · no card)",
+    "observe mode — compression off until you sign in (free account)",
     "MCP recovery missing — streaming turns and Claude Pro/Max sessions pass through uncompressed (non-streaming API-key traffic still compresses)",
     "cavemem not installed — memory and auto-recall are off",
   ];
@@ -102,10 +134,9 @@ test("half-installed status lists every supplied reason and never invents local 
 });
 
 test("status --json pins stable top-level key set and nullable contract", async () => {
-  const isolated = isolatedCliEnv();
-  const proxy = join(isolated.home, "bin", "status-proxy");
-  writeFileSync(proxy, `#!/usr/bin/env node
-const cmd = process.argv[2];
+  const isolated = statusEnv();
+  const proxy = nativeStub(join(isolated.home, "bin"), "status-proxy", `
+const cmd = ARGV[0];
 if (cmd === "version") {
   process.stdout.write(JSON.stringify({version:"test",schema:"caveman.proxy.run.v1",capabilities:["run_state","sessions_scanned","observe_token_accounting"]}));
 } else if (cmd === "status") {
@@ -113,12 +144,12 @@ if (cmd === "version") {
 } else if (cmd === "stats") {
   process.stdout.write(JSON.stringify({spans:0,tokens_in:0,token_accounting:{},basis:"inferred"}));
 } else process.exit(2);
-`, { mode: 0o755 });
+`);
   mkdirSync(join(isolated.home, ".caveman-cloud"), { recursive: true });
   writeFileSync(join(isolated.home, ".caveman-cloud", "config.json"), "{}");
   isolated.env.CAVEMAN_PROXY_BIN = proxy;
   try {
-    const out = await runCli(["status", "--json"], { env: isolated.env });
+    const out = await runCli(["status", "--json"], { env: isolated.env, cwd: isolated.home });
     assert.equal(out.code, 0, out.stderr);
     const parsed = JSON.parse(out.stdout);
     assert.deepEqual(Object.keys(parsed), [
@@ -133,7 +164,9 @@ if (cmd === "version") {
       "config_sources",
       "telemetry",
       "next",
+      "agent_traffic",
       "native_integrations",
+      "modules",
     ]);
     assert.deepEqual(parsed.native_integrations.map((item) => item.agent), [
       "claude", "codex", "hermes", "gemini", "opencode", "pi", "aider", "generic",
@@ -145,18 +178,17 @@ if (cmd === "version") {
   }
 });
 
-test("status with missing proxy emits half-installed block and no local zero rows", async () => {
-  const isolated = isolatedCliEnv({
+test("status with missing proxy names the missing binaries and no local zero rows", async () => {
+  const isolated = statusEnv({
     CAVEMAN_PROXY_BIN: join("/definitely", "missing", "caveman-proxy"),
     CAVEMEM_BIN: join("/definitely", "missing", "cavemem"),
   });
   try {
-    const out = await runCli(["status"], { env: isolated.env });
+    const out = await runCli(["status"], { env: isolated.env, cwd: isolated.home });
     assert.equal(out.code, 0, out.stderr);
-    assert.match(out.stdout, /caveman-proxy not installed/);
-    assert.match(out.stdout, /cavemem not installed/);
-    assert.match(out.stdout, /MCP recovery missing/);
-    assert.match(out.stdout, /next:  caveman setup --install/);
+    assert.match(out.stdout, /on  input .* caveman-proxy, cavemem not installed · caveman setup --install/);
+    assert.match(out.stdout, /on  waste-fixes .* caveman-proxy not installed/);
+    assert.match(out.stdout, /next: caveman setup --install/);
     assert.doesNotMatch(out.stdout, /tokens observed/);
     assert.doesNotMatch(out.stdout, /\bmem\s+0\b/);
   } finally {
@@ -164,45 +196,67 @@ test("status with missing proxy emits half-installed block and no local zero row
   }
 });
 
-test("status makes permanent native activation discoverable without expanding porcelain", async () => {
-  const isolated = isolatedCliEnv();
+test("status makes native activation discoverable through its next line", async () => {
+  const isolated = statusEnv();
   const bin = join(isolated.home, "bin");
-  const claude = join(bin, "claude");
-  const proxy = join(bin, "native-proxy");
-  writeFileSync(claude, '#!/bin/sh\necho "claude 2.1.226"\n', { mode: 0o755 });
-  writeFileSync(proxy, `#!/bin/sh
-if [ "$1" = "version" ] && [ "$2" = "--json" ]; then
-  printf '%s\\n' '{"version":"test","capabilities":["run_state","native_runtime_v1","typed_ccr"]}'
-elif [ "$1" = "status" ]; then
-  printf '%s\\n' '{"owner":"unknown"}'
-elif [ "$1" = "stats" ]; then
-  printf '%s\\n' '{"spans":0,"tokens_in":0,"token_accounting":{},"basis":"inferred"}'
-fi
-`, { mode: 0o755 });
-  isolated.env.PATH = `${bin}:${isolated.env.PATH}`;
+  nodeStub(bin, "claude", 'console.log("claude 2.1.226");');
+  const proxy = nativeStub(bin, "native-proxy", `
+if (ARGV[0] === "version") console.log(JSON.stringify({version:"test",capabilities:["run_state","native_runtime_v1","typed_ccr"]}));
+else if (ARGV[0] === "status") console.log(JSON.stringify({owner:"unknown"}));
+else if (ARGV[0] === "stats") console.log(JSON.stringify({spans:0,tokens_in:0,token_accounting:{},basis:"inferred"}));
+`);
   isolated.env.CAVEMAN_PROXY_BIN = proxy;
   try {
-    const out = await runCli(["status"], { env: isolated.env });
+    const out = await runCli(["status"], { env: isolated.env, cwd: isolated.home });
     assert.equal(out.code, 0, out.stderr);
-    assert.match(out.stdout, /native integrations/);
-    assert.match(out.stdout, /next native:  caveman enable claude/);
+    assert.match(out.stdout, /^ +claude$/m);
+    assert.match(out.stdout, /on  output +not wired/);
+    assert.match(out.stdout, /next: caveman enable claude/);
   } finally {
     isolated.cleanup();
   }
 });
 
-test("status gives cold native setup then enable path when runtime is missing", async () => {
-  const isolated = isolatedCliEnv();
+test("status points at the runtime install first when the proxy is missing", async () => {
+  const isolated = statusEnv();
   const bin = join(isolated.home, "bin");
-  writeFileSync(join(bin, "claude"), '#!/bin/sh\necho "claude 2.1.226"\n', { mode: 0o755 });
-  isolated.env.PATH = `${bin}:${isolated.env.PATH}`;
+  nodeStub(bin, "claude", 'console.log("claude 2.1.226");');
   isolated.env.CAVEMAN_PROXY_BIN = join("/definitely", "missing", "caveman-proxy");
   try {
-    const out = await runCli(["status"], { env: isolated.env });
+    const out = await runCli(["status"], { env: isolated.env, cwd: isolated.home });
     assert.equal(out.code, 0, out.stderr);
-    assert.match(out.stdout, /next native:  caveman setup --install/);
-    assert.match(out.stdout, /then:\s+caveman enable claude/);
+    assert.match(out.stdout, /on  output .* caveman-proxy not installed · caveman setup --install/);
+    assert.match(out.stdout, /^ +claude$/m);
+    assert.match(out.stdout, /next: caveman setup --install/);
   } finally {
     isolated.cleanup();
+  }
+});
+
+// The proxy counts the cache busts caveman itself caused (the client's bytes
+// repeated a cached prefix and the forwarded bytes did not). Any is a bug, so
+// status raises it; a client editing its own history is not counted.
+test("status raises caveman-caused cache busts as an off-state", async () => {
+  for (const count of [0, 2]) {
+    const isolated = statusEnv();
+    const proxy = nativeStub(join(isolated.home, "bin"), "bust-proxy", `
+if (ARGV[0] === "version") console.log(JSON.stringify({version:"test",capabilities:["run_state","mcp_recovery"]}));
+else if (ARGV[0] === "status") console.log(JSON.stringify({owner:"unknown"}));
+else if (ARGV[0] === "stats") console.log(JSON.stringify({spans:9,tokens_in:0,token_accounting:{},basis:"inferred",cache_bust_requests:5,caveman_cache_bust_requests:${count}}));
+`);
+    isolated.env.CAVEMAN_PROXY_BIN = proxy;
+    try {
+      const out = await runCli(["status", "--json"], { env: isolated.env, cwd: isolated.home });
+      assert.equal(out.code, 0, out.stderr);
+      const state = JSON.parse(out.stdout).off_states.find((item) => item.id === "cache-bust");
+      if (count === 0) {
+        assert.equal(state, undefined, "client-caused busts alone must not raise the off-state");
+      } else {
+        assert.ok(state, "caveman-caused busts must raise an off-state");
+        assert.match(state.line, /caveman changed bytes the provider had already cached on 2 requests today/);
+      }
+    } finally {
+      isolated.cleanup();
+    }
   }
 });

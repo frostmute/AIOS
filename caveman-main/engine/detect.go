@@ -3,6 +3,7 @@ package engine
 import (
 	"bytes"
 	"encoding/json"
+	"encoding/xml"
 	"regexp"
 
 	"github.com/JuliusBrussee/caveman/engine/compressors"
@@ -22,11 +23,12 @@ const (
 	TypeTerminal     = "terminal"
 	TypeTabular      = "tabular"
 	TypeConfig       = "config"
+	TypeTestReport   = "test-report"
 )
 
 var (
 	// Log lines carry a level token or a timestamp.
-	logLineRe    = regexp.MustCompile(`(?i)(\b(TRACE|DEBUG|INFO|WARN|WARNING|ERROR|FATAL|PANIC)\b|^\s*\[[A-Z]+\]|\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}|\b\d{2}:\d{2}:\d{2}\b)`)
+	logLineRe    = regexp.MustCompile(`(?i)(\b(TRACE|DEBUG|INFO|WARN|WARNING|ERROR|FATAL|PANIC|CRIT|CRITICAL|ALERT|EMERG|EMERGENCY)\b|^\s*\[[A-Z]+\]|\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}|\b\d{2}:\d{2}:\d{2}\b)`)
 	diffLineRe   = regexp.MustCompile(`(?m)^(diff --git |@@ |--- |\+\+\+ |[+-][^+-])`)
 	searchLineRe = regexp.MustCompile(`(?m)^([./~A-Za-z0-9_-][^:\n]{0,240}:\d+(:\d+)?:|https?://\S+)`)
 	// Strong source-code signals (word-boundary keywords across common langs).
@@ -49,7 +51,17 @@ func (e *Engine) Detect(input []byte) string {
 		return TypeText
 	}
 	if (trimmed[0] == '{' || trimmed[0] == '[') && json.Valid(trimmed) {
+		if trimmed[0] == '{' && looksLikeTestReportJSON(trimmed) && compressors.LooksTestReport(trimmed) {
+			return TypeTestReport
+		}
 		return TypeJSON
+	}
+	// JUnit runs before terminal so a report whose failure messages carry ANSI
+	// colors still routes to the test-report compressor, which strips them.
+	// Only a report that compressor accepts counts: Compress has no fallback,
+	// and the native runtime does not mask test-report output.
+	if looksLikeJUnitXML(trimmed) && compressors.LooksTestReport(trimmed) {
+		return TypeTestReport
 	}
 	// Terminal output is detected before diff/code/log because its ANSI-escape
 	// signal is conclusive: only raw command/terminal output carries it, so this
@@ -94,13 +106,15 @@ func looksLikeTerminal(input []byte) bool {
 }
 
 func looksLikeDiff(input []byte) bool {
-	matches := len(diffLineRe.FindAll(input, -1))
-	if matches < 4 {
-		return false
-	}
-	return bytes.Contains(input, []byte("\n@@ ")) ||
+	// The structural marker is necessary regardless of the line count. Check
+	// its literal bytes before scanning a large non-diff payload with a regexp.
+	marked := bytes.Contains(input, []byte("\n@@ ")) ||
 		bytes.Contains(input, []byte("diff --git ")) ||
 		(bytes.Contains(input, []byte("\n--- ")) && bytes.Contains(input, []byte("\n+++ ")))
+	if !marked {
+		return false
+	}
+	return len(diffLineRe.FindAll(input, 4)) >= 4
 }
 
 func looksLikeCode(input []byte) bool {
@@ -204,4 +218,44 @@ func looksLikeSearchResult(input []byte) bool {
 		}
 	}
 	return matched >= 4 && matched*3 >= len(lines)
+}
+
+// looksLikeTestReportJSON reads only the top-level keys of a JSON object: a
+// pytest-json-report has "exitcode" plus a "tests" array, a Jest report has
+// "numFailedTests" plus a "testResults" array. Keys nested deeper never count,
+// so unrelated JSON that mentions them keeps the JSON compressor.
+func looksLikeTestReportJSON(trimmed []byte) bool {
+	// Byte pre-check so ordinary JSON is not decoded a second time.
+	if !bytes.Contains(trimmed, []byte(`"exitcode"`)) && !bytes.Contains(trimmed, []byte(`"numFailedTests"`)) {
+		return false
+	}
+	var top map[string]json.RawMessage
+	if json.Unmarshal(trimmed, &top) != nil {
+		return false
+	}
+	isArray := func(key string) bool { v := top[key]; return len(v) > 0 && v[0] == '[' }
+	_, exitcode := top["exitcode"]
+	_, numFailed := top["numFailedTests"]
+	return (exitcode && isArray("tests")) || (numFailed && isArray("testResults"))
+}
+
+// looksLikeJUnitXML reports whether the document's root element is
+// <testsuites> or <testsuite>. Only the prolog (declaration, comments, doctype)
+// is read before that first element, so a diff or source file that mentions
+// JUnit tags never counts.
+func looksLikeJUnitXML(trimmed []byte) bool {
+	if trimmed[0] != '<' {
+		return false
+	}
+	dec := xml.NewDecoder(bytes.NewReader(trimmed))
+	for i := 0; i < 16; i++ {
+		tok, err := dec.RawToken()
+		if err != nil {
+			return false
+		}
+		if el, ok := tok.(xml.StartElement); ok {
+			return el.Name.Local == "testsuites" || el.Name.Local == "testsuite"
+		}
+	}
+	return false
 }

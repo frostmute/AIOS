@@ -17,28 +17,38 @@
 package main
 
 import (
+	"cmp"
 	"context"
+	"crypto/subtle"
+	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"log/slog"
+	"maps"
 	"net"
 	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
 	"github.com/JuliusBrussee/caveman/engine/ccr"
 	"github.com/JuliusBrussee/caveman/mem"
+	"github.com/JuliusBrussee/caveman/proxy/internal/cloudlink"
 	"github.com/JuliusBrussee/caveman/proxy/internal/config"
+	"github.com/JuliusBrussee/caveman/proxy/internal/identity"
 	"github.com/JuliusBrussee/caveman/proxy/internal/nativehook"
 	"github.com/JuliusBrussee/caveman/proxy/internal/nativeruntime"
 	"github.com/JuliusBrussee/caveman/proxy/internal/runstate"
+	"github.com/JuliusBrussee/caveman/proxy/internal/securehome"
+	"github.com/JuliusBrussee/caveman/proxy/internal/sessionusage"
 	"github.com/JuliusBrussee/caveman/proxy/internal/standalone"
 	"github.com/JuliusBrussee/caveman/proxy/internal/store"
 	"github.com/JuliusBrussee/caveman/shared/platform/env"
@@ -64,15 +74,23 @@ func main() {
 	case "usage":
 		runUsage(logger, os.Args[2:])
 	case "learn":
-		runLearn(logger, os.Args[2:])
+		// learn prints its result document on stdout; a failure has to reach
+		// stderr, which is the only stream the CLI surfaces when the child exits
+		// non-zero.
+		runLearn(slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{ReplaceAttr: redact.SlogReplaceAttr})), os.Args[2:])
 	case "status":
-		runStatus(logger, os.Args[2:])
+		// status prints one JSON document on stdout, which the CLI parses whole.
+		// Its diagnostics go to stderr so a config error cannot interleave a
+		// second JSON object into that document.
+		runStatus(slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{ReplaceAttr: redact.SlogReplaceAttr})), os.Args[2:])
 	case "version":
 		runVersion(os.Args[2:])
 	case "native-why":
 		runNativeWhy(logger, os.Args[2:])
 	case "native-hook":
 		runNativeHookBridge(os.Args[2:])
+	case "provider-login":
+		runProviderLogin(os.Args[2:])
 	case "serve":
 		runServe(logger)
 	default:
@@ -81,12 +99,15 @@ func main() {
 	}
 }
 
+const nativeHookMaxPayloadBytes = 2 * 1024 * 1024
+
 func runNativeHookBridge(args []string) {
 	if len(args) == 0 {
 		return
 	}
 	agent := args[0]
 	adapter := argFlag(args[1:], "--adapter", "")
+	node := argFlag(args[1:], "--node", "")
 	home := env.String("CAVEMAN_HOME", "")
 	if home == "" {
 		userHome, err := os.UserHomeDir()
@@ -95,11 +116,34 @@ func runNativeHookBridge(args []string) {
 		}
 		home = filepath.Join(userHome, ".caveman")
 	}
-	raw, err := io.ReadAll(io.LimitReader(os.Stdin, 2*1024*1024+1))
-	if err != nil || len(raw) > 2*1024*1024 {
+	raw, err := readNativeHookPayload(os.Stdin)
+	if err != nil || len(raw) > nativeHookMaxPayloadBytes {
 		return
 	}
-	_ = nativehook.Run(context.Background(), home, agent, adapter, raw, os.Stdout, os.Stderr)
+	_ = nativehook.Run(context.Background(), home, agent, adapter, node, raw, os.Stdout, os.Stderr)
+}
+
+func readNativeHookPayload(r io.Reader) ([]byte, error) {
+	raw := make([]byte, 0, 4096)
+	buf := make([]byte, 16*1024)
+	for {
+		n, err := r.Read(buf)
+		if n > 0 {
+			if len(raw)+n > nativeHookMaxPayloadBytes {
+				return nil, fmt.Errorf("native hook payload too large")
+			}
+			raw = append(raw, buf[:n]...)
+			if json.Valid(raw) {
+				return raw, nil
+			}
+		}
+		if err != nil {
+			if err == io.EOF {
+				return raw, nil
+			}
+			return nil, err
+		}
+	}
 }
 
 func runNativeWhy(logger *slog.Logger, args []string) {
@@ -159,7 +203,7 @@ func runServe(logger *slog.Logger) {
 	// The wrap CLI spawns this process detached with stdio ignored, so without
 	// a file every warning the proxy emits (upstream failures, copy errors) is
 	// lost and field reports like #897 arrive with no proxy-side evidence.
-	if f := openProxyLog(filepath.Join(home, "proxy.log")); f != nil {
+	if f := openProxyLog(filepath.Join(home, "proxy.log"), proxyLogMaxBytes); f != nil {
 		defer f.Close()
 		logger = slog.New(slog.NewJSONHandler(io.MultiWriter(os.Stdout, f), &slog.HandlerOptions{ReplaceAttr: redact.SlogReplaceAttr}))
 	}
@@ -167,6 +211,9 @@ func runServe(logger *slog.Logger) {
 	if err != nil {
 		logger.Error("cannot load caveman.yaml", "error", err)
 		os.Exit(1)
+	}
+	for _, skipped := range cfg.SkippedCABundles {
+		logger.Warn("CA bundle env var names an unusable file; skipped", "env", skipped.Env, "error", skipped.Error)
 	}
 	spend, err := store.Open(dbPath(home), logger)
 	if err != nil {
@@ -183,9 +230,53 @@ func runServe(logger *slog.Logger) {
 	// objects. Record mode still never writes recovery originals: it only permits
 	// metadata-safe native runtime state when an installed host pack sends events.
 	opts := standalone.Options{SessionMarkerKey: sessionMarkerKey, Logger: logger}
+	// Identity and TLS the operator configured never degrade to something
+	// weaker: an unreadable token map, OIDC setting or certificate stops startup.
+	ids, err := standalone.NewIdentity(cfg, logger)
+	if err != nil {
+		logger.Error("cannot load middleware identity", "error", err)
+		os.Exit(1)
+	}
+	var serverTLS *identity.ServerTLS
+	if cfg.TLS.CertFile != "" {
+		if serverTLS, err = identity.NewServerTLS(cfg.TLS.CertFile, cfg.TLS.KeyFile, cfg.TLS.ClientCAFile); err != nil {
+			logger.Error("cannot load TLS listener configuration", "error", err)
+			os.Exit(1)
+		}
+		ids.UseServerTLS(serverTLS) // client certificates re-verify per request
+	}
+	var middlewareStore store.MiddlewareStore = spend
+	if databaseURL := cfg.Middleware.DatabaseURL; databaseURL != "" {
+		shared, err := store.OpenPostgresMiddleware(context.Background(), databaseURL)
+		if err != nil {
+			logger.Error("cannot open the middleware Postgres store", "error", err)
+			os.Exit(1)
+		}
+		defer shared.Close()
+		middlewareStore = shared
+	}
+	framework, err := standalone.NewMiddleware(cfg, middlewareStore, recovery, version, logger, ids)
+	switch {
+	case err != nil && cfg.Middleware.Configured():
+		// A middleware the operator configured (a shared store, keys, identity,
+		// limits) that cannot start exits (and restarts) rather than serving
+		// 503s behind a ready probe. Errors carry no secrets; key errors never
+		// echo the key.
+		logger.Error("framework middleware unavailable", "code", "runtime_initialization", "error", err)
+		os.Exit(1)
+	case err != nil:
+		// The default local middleware: inference keeps working, and readiness
+		// reports the middleware "degraded" (see gateway.Server.ready).
+		logger.Warn("framework middleware unavailable", "code", "runtime_initialization", "error", err)
+		opts.Middleware = middlewareDown{err}
+	default:
+		opts.Middleware = framework
+	}
 	switch {
 	case (cfg.Mode == "compress" || cfg.Mode == "pixel") && recovery != nil:
-		opts.Compressor = standalone.NewEngineCompressor(recovery)
+		// With the logger: a recovery store that cannot be written stops
+		// compression, and that must not be silent (#1149).
+		opts.Compressor = standalone.NewEngineCompressorWithLogger(recovery, logger)
 		// The spend store doubles as the durable replacement cache that keeps a
 		// compressed message byte-identical on every later turn of a conversation.
 		opts.PrefixCache = spend
@@ -194,17 +285,50 @@ func runServe(logger *slog.Logger) {
 		opts.ObserveEstimate = true
 	}
 	var nativeRuntime *nativeruntime.Runtime
+	var flushRows func() // set once the server exists, before anything serves
 	if recovery != nil {
-		nativeRuntime = nativeruntime.NewWithReceiptsAndUsage(recovery, filepath.Join(home, "receipts"), spend)
+		usage := usageAfterFlush{flush: func() { flushRows() }, spend: spend}
+		nativeRuntime = nativeruntime.NewWithReceiptsAndUsage(recovery, filepath.Join(home, "receipts"), usage)
 		opts.SessionFallback = func(now time.Time, provider, model string) (string, string) {
 			return nativeRuntime.UniqueRecentSession(now, 5*time.Second, provider, model)
 		}
 	}
 
+	// Routing asks and runtime/v1 events, only while the CLI is signed in with
+	// the routing module on; every Cloud failure keeps the asked model.
+	link := cloudlink.New(home, logger)
+	link.Start() // the keychain read starts now, not on the first request
+	opts.Cloud = link
+	if nativeRuntime != nil {
+		// A session or prompt starting warms the route path before its model request.
+		nativeRuntime.OnTurnStart = link.Prime
+	}
+	// Rows are finished and written off the request path; server.Close below
+	// writes the last of them before the deferred spend.Close.
+	opts.AsyncRecord = true
+	opts.CacheWarm = cacheWarmSwitch(home, os.Getenv("CAVEMAN_CACHE_WARM"))
+	opts.CacheWarmState = filepath.Join(home, "cache-warm-gaps.json")
 	server := standalone.New(cfg, spend, opts)
+	flushRows = server.Flush
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
+	if framework != nil {
+		// Expiry sweeps and batched retrieve renewals, off the request path.
+		go framework.Run(ctx)
+	}
+	reloaders := map[string]identity.Reloader{}
+	if cfg.Middleware.TokenMapFile != "" {
+		reloaders["token_map"] = ids
+	}
+	if serverTLS != nil {
+		reloaders["tls"] = serverTLS
+	}
+	if len(reloaders) > 0 {
+		// Rotated tokens and renewed certificates apply without a restart: on
+		// file change (Kubernetes Secret updates included) or SIGHUP.
+		go identity.Watch(ctx, logger, 10*time.Second, reloaders)
+	}
 	if nativeRuntime != nil {
 		go func() {
 			if err := nativeruntime.Serve(ctx, home, nativeRuntime); err != nil && ctx.Err() == nil {
@@ -212,41 +336,15 @@ func runServe(logger *slog.Logger) {
 			}
 		}()
 	}
-	if env.String("CAVEMAN_PROXY_OWNER", "start") == "wrap" {
-		idleTimeout := 30 * time.Minute
-		if raw := env.String("CAVEMAN_NATIVE_IDLE_TIMEOUT", ""); raw != "" {
-			parsed, parseErr := time.ParseDuration(raw)
-			if parseErr != nil || parsed <= 0 {
-				logger.Warn("invalid native idle timeout; using default", "value", raw, "default", idleTimeout)
-			} else {
-				idleTimeout = parsed
-			}
-		}
-		if nativeRuntime != nil {
-			go func() {
-				if nativeRuntime.WaitForIdle(ctx, idleTimeout) {
-					logger.Info("caveman proxy idle; shutting down", "idle_timeout", idleTimeout)
-					cancel()
-				}
-			}()
-		}
-	}
+	// A base URL can outlive the wrapper or any observed hook session. Never
+	// retire its listener on an idle clock, even when an old install exports
+	// CAVEMAN_NATIVE_IDLE_TIMEOUT. Only an explicit stop or process failure ends it.
 
 	handler := server.Handler()
 	if nativeRuntime != nil {
-		// Loopback liveness beacon for the wrap CLI: while a wrapped agent
-		// process is alive its wrap heartbeats here, which holds off the
-		// wrap-owned idle exit above (issue #860). It only refreshes the idle
-		// clock — no session state, no metering, nothing recorded.
-		proxied := handler
-		handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			if r.URL.Path == "/caveman/keepalive" && r.Method == http.MethodPost {
-				nativeRuntime.Keepalive()
-				w.WriteHeader(http.StatusNoContent)
-				return
-			}
-			proxied.ServeHTTP(w, r)
-		})
+		// Keep accepting heartbeats from older CLIs. Listener lifetime no longer
+		// depends on these beacons or on native session tracking.
+		handler = withKeepalive(handler, nativeRuntime.Keepalive)
 	}
 	srv := &http.Server{
 		Addr:              cfg.Listen,
@@ -261,6 +359,9 @@ func runServe(logger *slog.Logger) {
 		logger.Error("cannot bind proxy listener", "addr", cfg.Listen, "error", err)
 		os.Exit(1)
 	}
+	if serverTLS != nil {
+		listener = tls.NewListener(listener, serverTLS.Config())
+	}
 	state, err := runstate.New(cfg.Listen, cfg.Mode, env.String("CAVEMAN_PROXY_OWNER", "start"), version)
 	if err != nil {
 		_ = listener.Close()
@@ -270,13 +371,39 @@ func runServe(logger *slog.Logger) {
 	// Publish active gate inputs so a later wrap can prove a reused proxy matches
 	// its requested recovery contract before making a compression claim.
 	state.RecoveryViaMCP = env.String("CAVEMAN_RECOVERY", "") == "mcp"
+	state.CompatUpstreams = compatUpstreams(cfg)
+	state.ProviderUpstreams = standalone.ProviderUpstreams(cfg)
+	state.CompatForwardHeaders = make(map[string][]string)
+	for name, mount := range cfg.CompatUpstreams() {
+		state.CompatForwardHeaders[name] = append([]string(nil), mount.ForwardHeaders...)
+	}
+	srv.Handler = withRunState(handler, state, loopbackListen(cfg.Listen), cancel)
 	if err := runstate.Write(home, state); err != nil {
 		_ = listener.Close()
 		logger.Error("cannot write proxy run state", "error", err)
 		os.Exit(1)
 	}
+	// Whether inbound requests are gated is the difference between a loopback
+	// dev proxy and one reachable from a VPC. Log the fact, never the token.
+	var mechanisms []string
+	for mechanism, on := range map[string]bool{"token": cfg.AuthToken != "", "token_map": cfg.Middleware.TokenMapFile != "",
+		"oidc": cfg.Middleware.OIDC.Issuer != "", "mtls": cfg.TLS.ClientCAFile != ""} {
+		if on {
+			mechanisms = append(mechanisms, mechanism)
+		}
+	}
+	slices.Sort(mechanisms)
+	inboundAuth := cmp.Or(strings.Join(mechanisms, ","), "none")
+	if cfg.AuthToken != "" {
+		// A token on a loopback listener still gates every request, but the
+		// local `caveman wrap` path sends none — /health/live stays green while
+		// each inference 401s. Say so once here, where it is readable.
+		if loopbackListen(cfg.Listen) {
+			logger.Warn("CAVEMAN_AUTH_TOKEN is set on a loopback listener; local clients must present the token in x-cave-api-key or Authorization: Bearer", "addr", cfg.Listen)
+		}
+	}
 	go func() {
-		logger.Info("caveman proxy listening", "addr", cfg.Listen, "mode", cfg.Mode, "basis", "inferred")
+		logger.Info("caveman proxy listening", "addr", cfg.Listen, "mode", cfg.Mode, "basis", "inferred", "inbound_auth", inboundAuth, "tls", serverTLS != nil)
 		if err := srv.Serve(listener); err != nil && err != http.ErrServerClosed {
 			logger.Error("proxy stopped", "error", err)
 			cancel()
@@ -286,9 +413,134 @@ func runServe(logger *slog.Logger) {
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer shutdownCancel()
 	_ = srv.Shutdown(shutdownCtx)
+	_ = server.Close() // saves what cache warming learned, writes the last rows
 	if err := runstate.RemoveMatching(home, state.Port, state.InstanceToken); err != nil {
 		logger.Warn("cannot remove proxy run state", "error", err)
 	}
+}
+
+// usageAfterFlush reads a session's usage once the rows still being finished
+// off the request path are written, so the session's receipt counts its last
+// request.
+type usageAfterFlush struct {
+	flush func()
+	spend *store.Store
+}
+
+func (u usageAfterFlush) SessionUsage(sessionID string) (sessionusage.Snapshot, error) {
+	u.flush()
+	return u.spend.SessionUsage(sessionID)
+}
+
+// middlewareDown stands in for a default middleware that failed to start: its
+// routes answer 503 runtime_unavailable, as with no middleware at all, and
+// readiness reports it degraded.
+type middlewareDown struct{ err error }
+
+func (d middlewareDown) Ready(context.Context) error { return d.err }
+
+func (middlewareDown) ServeHTTP(w http.ResponseWriter, _ *http.Request) {
+	for name, value := range map[string]string{"Retry-After": "1", "Content-Type": "application/json", "Cache-Control": "no-store", "X-Content-Type-Options": "nosniff"} {
+		w.Header().Set(name, value)
+	}
+	w.WriteHeader(http.StatusServiceUnavailable)
+	_, _ = io.WriteString(w, `{"schema_version":1,"error":{"code":"runtime_unavailable"}}`+"\n")
+}
+
+// withKeepalive answers the no-op beacon older CLIs still send. It sits OUTSIDE
+// the gateway's inbound token gate on purpose: the beacon carries no credential,
+// reads nothing and changes nothing, and a 401 here would make an old CLI log a
+// failure for a call whose only effect is a timestamp.
+func withKeepalive(next http.Handler, beacon func()) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/caveman/keepalive" && r.Method == http.MethodPost {
+			beacon()
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// loopbackListen reports whether addr binds only the local machine. It is the
+// one test behind two decisions: whether a token on this listener deserves the
+// startup warning, and whether the instance identity header may be published.
+func loopbackListen(addr string) bool {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		return false
+	}
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
+}
+
+// withInstanceIdentity proves that the health listener is the generation named
+// by its run-state file. The token is never attached to inference traffic.
+//
+// loopback gates the whole header: the only consumer is the local CLI matching
+// a run-state file it can already read, so on a shared listener the header
+// hands every unauthenticated /health/live caller a value that correlates
+// restarts and distinguishes instances behind a load balancer, for nothing.
+// A wildcard bind (0.0.0.0, ::) is the one shared listener the CLI and status
+// still reach through loopback, so there a loopback caller gets the header and
+// a caller from the network still does not.
+func withInstanceIdentity(next http.Handler, token, listen string) http.Handler {
+	loopback := loopbackListen(listen)
+	host, _, err := net.SplitHostPort(listen)
+	ip := net.ParseIP(host)
+	wildcard := err == nil && (host == "" || ip != nil && ip.IsUnspecified())
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if (loopback || wildcard && loopbackListen(r.RemoteAddr)) && r.Method == http.MethodGet && r.URL.Path == "/health/live" {
+			w.Header().Set(runstate.InstanceHeader, token)
+			w.Header().Set("Cache-Control", "no-store")
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// withRunState serves the two run-state endpoints: the instance identity any
+// local caller may read, and the shutdown only the run-state file's reader may
+// send.
+func withRunState(next http.Handler, state runstate.State, loopback bool, stop func()) http.Handler {
+	return withShutdown(withInstanceIdentity(next, state.InstanceToken, state.Listen), state.ShutdownToken, loopback, stop)
+}
+
+// withShutdown is `caveman stop` on Windows, where no signal reaches a
+// detached process gracefully: POST /caveman/shutdown runs the same drain as
+// SIGTERM. Loopback only, and only for the caller holding this generation's
+// run-state shutdown token; it sits outside the inbound token gate like the
+// keepalive. The CLI sends no Origin or Sec-Fetch-Site and names a loopback
+// Host, so a request carrying either header or another Host (a browser page,
+// a DNS-rebound name) is refused before the token is compared.
+func withShutdown(next http.Handler, token string, loopback bool, stop func()) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if loopback && token != "" && r.Method == http.MethodPost && r.URL.Path == "/caveman/shutdown" {
+			if len(r.Header.Values("Origin")) > 0 || len(r.Header.Values("Sec-Fetch-Site")) > 0 || !loopbackListen(r.Host) ||
+				subtle.ConstantTimeCompare([]byte(r.Header.Get(runstate.ShutdownHeader)), []byte(token)) != 1 {
+				w.WriteHeader(http.StatusForbidden)
+				return
+			}
+			w.WriteHeader(http.StatusAccepted)
+			stop()
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// compatUpstreams flattens the named OpenAI-compatible mounts to name → base URL
+// for publication in the run-state file. A client cannot otherwise learn which
+// /compat/<name>/ mounts this proxy actually serves.
+func compatUpstreams(cfg config.Config) map[string]string {
+	upstreams := cfg.CompatUpstreams()
+	out := make(map[string]string, len(upstreams))
+	for name, upstream := range upstreams {
+		out[name] = upstream.BaseURL
+	}
+	return out
 }
 
 // initializeNativePersistence keeps provider routing usable when local recovery
@@ -325,16 +577,23 @@ func runStatus(logger *slog.Logger, args []string) {
 		}
 		port = parsed
 	} else {
+		// Status reads the port from the same config the proxy serves on. A config
+		// that does not load says nothing about the listener: report Unknown with
+		// the reason on stderr rather than probing DefaultListen, which would
+		// report some other port's state as if it were this config's.
 		cfg, err := config.Load(env.String("CAVEMAN_CONFIG", filepath.Join(home, "caveman.yaml")))
 		if err != nil {
+			logger.Error("cannot load caveman.yaml; status is unknown", "error", err)
 			printJSON(runstate.Unknown())
 			return
 		}
-		port, err = runstate.PortFromListen(cfg.Listen)
+		parsed, err := runstate.PortFromListen(cfg.Listen)
 		if err != nil {
+			logger.Error("caveman.yaml listen is not a usable address", "listen", cfg.Listen, "error", err)
 			printJSON(runstate.Unknown())
 			return
 		}
+		port = parsed
 	}
 	printJSON(runstate.ReadValidated(home, port))
 }
@@ -362,6 +621,10 @@ func runVersion(args []string) {
 // runStats prints the local spend summary as JSON for `caveman stats`. The
 // summary's basis is always "inferred"; the figures are never re-projected.
 func runStats(logger *slog.Logger, args []string) {
+	if hasArg(args, "--report") {
+		runStatsReport(logger, args)
+		return
+	}
 	home := mustHome(logger)
 	spend, err := store.Open(dbPath(home), logger)
 	if err != nil {
@@ -563,6 +826,13 @@ func runLearn(logger *slog.Logger, args []string) {
 		sub = args[0]
 		args = args[1:]
 	}
+	if sub == "capabilities" {
+		// The CLI's autopilot probes this before an unattended scan: an older
+		// proxy ignores unknown flags, so it would silently write cavemem and
+		// the canonical report. Answered before the store opens, so it is cheap.
+		printJSON(learnCapabilities())
+		return
+	}
 	home := mustHome(logger)
 	spend := mustStore(logger, home)
 	defer spend.Close()
@@ -576,24 +846,48 @@ func runLearn(logger *slog.Logger, args []string) {
 
 	switch sub {
 	case "scan":
-		fmt.Fprintln(os.Stderr, "scanning local sessions (last 30d)…")
+		scope := "your agent sessions"
+		if picked := strings.Trim(strings.Join(sources, ","), ","); picked != "" {
+			scope = picked + " sessions"
+		}
+		fmt.Fprintf(os.Stderr, "reading %s from the last %s…\n", scope, since)
 		// --retro is opt-in: without it the scan runs exactly as before. With it,
 		// both passes are independently bounded so a cold base scan cannot consume
 		// the child deadline before retro returns partial measured coverage.
 		retro := learnRetroOptions(args)
-		plan, err := spend.LearnScanFilteredWithRetro(sources, since, retro, repoFilter)
+		var plan store.LearnPlan
+		var err error
+		if hasArg(args, "--no-remember") {
+			// Unattended scans (autopilot) must not grow cavemem: sink titles
+			// embed changing counts, so every run would store a near-duplicate.
+			plan, err = spend.BuildLearnPlanFilteredWithRetro(cwd, sources, since, retro, repoFilter)
+		} else {
+			plan, err = spend.LearnScanFilteredWithRetro(sources, since, retro, repoFilter)
+		}
 		if err != nil {
 			fatalJSON(logger, err)
 		}
-		fmt.Fprintf(os.Stderr, "claude-code %d · codex %d · scoring…\n",
-			plan.SessionsBySource["claude"], plan.SessionsBySource["codex"])
+		// --reports-home keeps an unattended scan's report, snapshots and trend
+		// history apart from the canonical ones a user's own run writes.
+		reportsHome := argFlag(args, "--reports-home", home)
+		store.AttachLearnTrendHistory(&plan, reportsHome, time.Now())
+		counts := []string{}
+		for _, source := range slices.Sorted(maps.Keys(plan.SessionsBySource)) {
+			if n := plan.SessionsBySource[source]; n > 0 {
+				counts = append(counts, fmt.Sprintf("%s %d", source, n))
+			}
+		}
+		if len(counts) == 0 {
+			counts = append(counts, "none")
+		}
+		fmt.Fprintf(os.Stderr, "sessions found: %s · scoring…\n", strings.Join(counts, " · "))
 		if hasArg(args, "--write-report") {
-			out := argFlag(args, "--out", store.DefaultLearnReportPath(home))
+			out := argFlag(args, "--out", store.DefaultLearnReportPath(reportsHome))
 			if err := spend.WriteLearnHTML(plan, out); err != nil {
 				fatalJSON(logger, err)
 			}
 			generation := argFlag(args, "--write-report-token", "")
-			if _, err := spend.WriteLearnSidecars(home, plan, time.Now(), generation); err != nil {
+			if _, err := spend.WriteLearnSidecars(reportsHome, plan, time.Now(), generation); err != nil {
 				fatalJSON(logger, err)
 			}
 		}
@@ -605,6 +899,7 @@ func runLearn(logger *slog.Logger, args []string) {
 		if err != nil {
 			fatalJSON(logger, err)
 		}
+		store.AttachLearnTrendHistory(&plan, home, time.Now())
 		out := argFlag(args, "--out", store.DefaultLearnReportPath(home))
 		if err := spend.WriteLearnHTML(plan, out); err != nil {
 			fatalJSON(logger, err)
@@ -629,7 +924,7 @@ func runLearn(logger *slog.Logger, args []string) {
 		if sinkID == "" {
 			fatalJSON(logger, fmt.Errorf("usage: caveman-proxy learn apply <sink_id> [--dry-run]"))
 		}
-		plan, err := spend.BuildLearnPlan(cwd, sources, since)
+		plan, err := spend.BuildLearnPlanFilteredWithRetro(cwd, sources, since, store.RetroOptions{}, repoFilter)
 		if err != nil {
 			fatalJSON(logger, err)
 		}
@@ -658,8 +953,23 @@ func runLearn(logger *slog.Logger, args []string) {
 			fatalJSON(logger, err)
 		}
 		printJSON(simulation)
+	case "experiment":
+		runLearnExperiment(logger, spend, cwd, sources, args)
+	case "export":
+		runLearnExport(logger, spend, home, cwd, sources, since, args)
+	case "reconcile":
+		runLearnReconcile(logger, spend, cwd, sources, since, args)
 	default:
 		fatalJSON(logger, fmt.Errorf("unknown learn subcommand: %s", sub))
+	}
+}
+
+func learnCapabilities() map[string]any {
+	return map[string]any{
+		"schema":        "caveman.learn.capabilities.v1",
+		"no_remember":   true,
+		"reports_home":  true,
+		"memory_health": true,
 	}
 }
 
@@ -667,9 +977,10 @@ var positionalValueFlags = map[string]bool{
 	"--agent": true, "--behavior-budget-ms": true, "--build": true,
 	"--command": true, "--decision": true, "--exit-code": true,
 	"--fix-kind": true, "--note": true, "--out": true, "--path": true,
-	"--plan": true, "--port": true, "--recent": true, "--repo": true,
+	"--plan": true, "--port": true, "--recent": true, "--repo": true, "--reports-home": true,
 	"--retro-budget-ms": true, "--session": true, "--since": true,
 	"--sources": true, "--trial-id": true, "--write-report-token": true,
+	"--sink": true, "--usage-export": true,
 }
 
 func learnSinkPositionals(args []string) []string {
@@ -934,17 +1245,68 @@ func fatalJSON(logger *slog.Logger, err error) {
 }
 
 // mustHome resolves and creates the ~/.caveman directory, honoring CAVEMAN_HOME.
-// openProxyLog appends to path, rotating a single previous generation once the
-// file passes 16MB. Nil on any error: logging must never block serving.
-func openProxyLog(path string) *os.File {
-	if info, err := os.Stat(path); err == nil && info.Size() > 16<<20 {
-		_ = os.Rename(path, path+".1")
-	}
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
-	if err != nil {
+// proxyLogMaxBytes is where proxy.log rotates to one previous generation.
+const proxyLogMaxBytes = 16 << 20
+
+// proxyLog appends to a file and rotates a single previous generation (.1)
+// whenever a write would pass max, while serving and not only at startup: the
+// middleware audit trail writes a line per request. Nil on any open error:
+// logging must never block serving.
+type proxyLog struct {
+	mu   sync.Mutex
+	path string
+	max  int64
+	f    *os.File
+	size int64
+}
+
+func openProxyLog(path string, max int64) *proxyLog {
+	l := &proxyLog{path: path, max: max}
+	if l.open() != nil {
 		return nil
 	}
-	return f
+	return l
+}
+
+func (l *proxyLog) open() error {
+	f, err := os.OpenFile(l.path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		return err
+	}
+	info, err := f.Stat()
+	if err != nil {
+		_ = f.Close()
+		return err
+	}
+	l.f, l.size = f, info.Size()
+	return nil
+}
+
+func (l *proxyLog) Write(p []byte) (int, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.f != nil && l.size > 0 && l.size+int64(len(p)) > l.max {
+		_ = l.f.Close()
+		_ = os.Rename(l.path, l.path+".1")
+		if l.open() != nil {
+			l.f = nil
+		}
+	}
+	if l.f == nil {
+		return len(p), nil // stdout still gets the line
+	}
+	n, err := l.f.Write(p)
+	l.size += int64(n)
+	return n, err
+}
+
+func (l *proxyLog) Close() error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.f == nil {
+		return nil
+	}
+	return l.f.Close()
 }
 
 func mustHome(logger *slog.Logger) string {
@@ -960,6 +1322,9 @@ func mustHome(logger *slog.Logger) string {
 	if err := os.MkdirAll(home, 0o700); err != nil {
 		logger.Error("cannot create ~/.caveman", "error", err)
 		os.Exit(1)
+	}
+	if err := securehome.Restrict(home); err != nil {
+		logger.Warn("cannot make ~/.caveman private to this user", "error", err)
 	}
 	return home
 }

@@ -17,7 +17,7 @@ import { request as httpRequest, type OutgoingHttpHeaders } from "node:http";
 import { request as httpsRequest, type RequestOptions } from "node:https";
 import { Readable } from "node:stream";
 import { connect as tlsConnect } from "node:tls";
-import type { Socket } from "node:net";
+import { isIP, type Socket } from "node:net";
 
 /** Redirect hops to follow before giving up, matching the fetch spec's limit. */
 const MAX_REDIRECTS = 20;
@@ -245,7 +245,8 @@ function sendThroughProxy(request: ProxiedRequest, proxy: URL): Promise<Response
             method,
             path: `${url.pathname}${url.search}`,
             headers: { ...headers, host: url.host },
-            createConnection: () => tlsConnect({ socket, servername: url.hostname }),
+            // Node 26 rejects an IP literal as SNI servername; omit it for IP targets.
+            createConnection: () => tlsConnect({ socket, host: url.hostname, servername: isIP(url.hostname) ? undefined : url.hostname }),
           },
           httpsRequest,
         );

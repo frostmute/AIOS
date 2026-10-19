@@ -1,3 +1,4 @@
+import { publishedForwardHeadersOf, publishedUpstreamsOf } from "../../cli/src/provider-routing.ts";
 // Caveman native extension for Pi. One model-visible tool (caveman_retrieve),
 // lifecycle bridged into the Caveman native runtime, gated provider routing to
 // the local proxy, byte-stable Core injection, and post-tool output shrinking.
@@ -12,7 +13,7 @@ import { join } from "node:path";
 import { Type } from "typebox";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { HookBridge, promptDigest, taskContinuation, taskTerms, taskType } from "./lifecycle.ts";
-import { MAX_CONTEXT_BYTES, additionalContextOf } from "./protocol.ts";
+import { MAX_CONTEXT_BYTES, additionalContextOf, isLoopbackUrl } from "./protocol.ts";
 import { ProviderRouter } from "./provider.ts";
 import { RecoveryClient } from "./recovery.ts";
 import { shrinkToolResult } from "./tool-output.ts";
@@ -24,20 +25,40 @@ function cavemanHome(): string {
   return process.env.CAVEMAN_HOME || join(homedir(), ".caveman");
 }
 
+// The CLI's config is $CAVEMAN_HOME/cloud.json; the pre-v4
+// ~/.caveman-cloud/config.json counts only while the new file does not exist.
+// Its gatewayUrl is the traffic target only when chosen at login
+// (managedGateway); signing in alone keeps the local proxy, on the port setup
+// moved it to (localPort) when another program held 8787.
 function gatewayUrl(): string {
   const env = process.env.CAVE_GATEWAY_URL?.trim();
   if (env) return env;
-  try {
-    const config = JSON.parse(readFileSync(join(homedir(), ".caveman-cloud", "config.json"), "utf8"));
-    if (typeof config.gatewayUrl === "string" && config.gatewayUrl) return config.gatewayUrl;
-  } catch { /* no config — default below */ }
+  for (const path of [join(cavemanHome(), "cloud.json"), join(homedir(), ".caveman-cloud", "config.json")]) {
+    let raw: string;
+    try {
+      raw = readFileSync(path, "utf8");
+    } catch {
+      continue;
+    }
+    try {
+      const config = JSON.parse(raw);
+      if (config.managedGateway === true && typeof config.gatewayUrl === "string" && config.gatewayUrl) return config.gatewayUrl;
+      if (Number.isInteger(config.localPort) && config.localPort >= 1024 && config.localPort <= 65535) return `http://127.0.0.1:${config.localPort}`;
+    } catch { /* unreadable config — default below */ }
+    break;
+  }
   return "http://127.0.0.1:8787";
 }
 
-function runStateRecoveryViaMcp(gateway: string): boolean | undefined {
+type RunState = { instanceToken: string; recoveryViaMcp: boolean; compatUpstreams: Record<string, string>; providerUpstreams: Record<string, string>; compatForwardHeaders: Record<string, string[]> };
+
+// readRunState returns the gate inputs the running proxy published, or undefined
+// when no valid run-state file for this gateway exists.
+function readRunState(gateway: string): RunState | undefined {
   let port: string;
   try {
     const url = new URL(gateway);
+    if (!isLoopbackUrl(gateway) || url.pathname !== "/" || url.search || url.hash || url.username || url.password) return undefined;
     port = url.port || (url.protocol === "https:" ? "443" : "80");
   } catch {
     return undefined;
@@ -48,26 +69,28 @@ function runStateRecoveryViaMcp(gateway: string): boolean | undefined {
     // CLI's field validation and require the recorded pid to still be alive so
     // a stale file (or a stranger on the port) can never open the gate.
     if (state?.schema !== "caveman.proxy.run.v1") return undefined;
-    if (typeof state.pid !== "number" || typeof state.instance_token !== "string") return undefined;
+    if (!Number.isSafeInteger(state.pid) || state.pid < 1 || state.port !== Number(port)
+      || typeof state.instance_token !== "string" || !state.instance_token) return undefined;
     if (state.owner !== "wrap" && state.owner !== "start") return undefined;
     try {
       process.kill(state.pid, 0);
     } catch {
       return undefined;
     }
-    return Boolean(state.recovery_via_mcp);
+    // compat_upstreams is absent in files written by an older proxy.
+    return { instanceToken: state.instance_token, recoveryViaMcp: state.recovery_via_mcp === true, compatUpstreams: publishedUpstreamsOf(state.compat_upstreams), providerUpstreams: publishedUpstreamsOf(state.provider_upstreams), compatForwardHeaders: publishedForwardHeadersOf(state.compat_forward_headers) };
   } catch {
     return undefined;
   }
 }
 
-async function proxyAliveOnce(gateway: string): Promise<boolean> {
+async function proxyAliveOnce(gateway: string, instanceToken: string): Promise<boolean> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), HEALTH_TIMEOUT_MS);
   try {
-    const response = await fetch(`${gateway.replace(/\/+$/, "")}/health/live`, { signal: controller.signal });
+    const response = await fetch(`${gateway.replace(/\/+$/, "")}/health/live`, { signal: controller.signal, redirect: "error" });
     await response.body?.cancel();
-    return response.ok;
+    return response.ok && response.headers.get("x-caveman-instance") === instanceToken;
   } catch {
     return false;
   } finally {
@@ -77,12 +100,13 @@ async function proxyAliveOnce(gateway: string): Promise<boolean> {
 
 // A proxy the SessionStart hook just autostarted may be a few hundred ms behind
 // the first probe; retry briefly before declaring the session direct.
-async function proxyAlive(gateway: string): Promise<boolean> {
+async function readLiveRunState(gateway: string): Promise<RunState | undefined> {
   for (let attempt = 0; attempt < 3; attempt++) {
-    if (await proxyAliveOnce(gateway)) return true;
+    const state = readRunState(gateway);
+    if (state && await proxyAliveOnce(gateway, state.instanceToken)) return state;
     await new Promise((resolve) => setTimeout(resolve, 300));
   }
-  return false;
+  return undefined;
 }
 
 export default function (pi: ExtensionAPI) {
@@ -154,6 +178,11 @@ export default function (pi: ExtensionAPI) {
     coreContext = undefined;
     pendingContext = [];
     pendingBytes = 0;
+    // A failed gate in a replacement session must not retain the old route.
+    if (!(await router.closeGate(ctx))) {
+      gateDone = true;
+      return;
+    }
     try {
       sessionId = ctx.sessionManager.getSessionId() || "default";
     } catch {
@@ -175,19 +204,18 @@ export default function (pi: ExtensionAPI) {
     // disables the proxy's server-side retrieve fallback, so a "both false"
     // session could never compress anything and must stay direct instead.
     const gateway = gatewayUrl();
-    const alive = await proxyAlive(gateway);
-    const published = runStateRecoveryViaMcp(gateway);
-    const recoveryReady = alive ? await recovery.ensure() : false;
+    const published = await readLiveRunState(gateway);
+    const recoveryReady = published ? await recovery.ensure() : false;
     gateDone = true;
-    if (!alive || published === undefined) {
+    if (!published) {
       notify(ctx, "Caveman: direct mode, no compression this session (local proxy not running)", "warning");
       return;
     }
-    if (!published || !recoveryReady) {
+    if (!published.recoveryViaMcp || !recoveryReady) {
       notify(ctx, "Caveman: direct mode, no compression this session (recovery not available — run `caveman doctor pi`)", "warning");
       return;
     }
-    await router.openGate(gateway, ctx);
+    await router.openGate(gateway, ctx, published.compatUpstreams, published.providerUpstreams, published.compatForwardHeaders);
   }));
 
   pi.on("model_select", GUARD_model_select(async (event: { model: ExtensionContext["model"] }, ctx: ExtensionContext) => {
@@ -196,15 +224,20 @@ export default function (pi: ExtensionAPI) {
     if (gateDone) await router?.apply(event.model, ctx);
   }));
 
-  pi.on("before_agent_start", GUARD_before_agent_start(async (event: { prompt: string; systemPrompt: string }, ctx: ExtensionContext) => {
+  pi.on("before_agent_start", GUARD_before_agent_start(async (event: { prompt?: string; systemPrompt: string }, ctx: ExtensionContext) => {
+    // Provider registration changes can refresh Pi's active model without a
+    // model_select event. Recheck that current object before every new turn.
+    if (gateDone) await router?.apply(ctx.model, ctx);
+    // Pi 1.1+ also fires this for extension-sent custom messages, which carry no prompt.
+    const prompt = event.prompt ?? "";
     const response = await bridge.call("UserPromptSubmit", {
       session_id: sessionId,
       model: ctx.model?.id,
       provider: ctx.model?.provider,
-      prompt: promptDigest(event.prompt),
-      task_type: taskType(event.prompt),
-      task_terms: taskTerms(event.prompt),
-      task_continuation: taskContinuation(event.prompt),
+      prompt: promptDigest(prompt),
+      task_type: taskType(prompt),
+      task_terms: taskTerms(prompt),
+      task_continuation: taskContinuation(prompt),
     });
     const dynamic = [additionalContextOf(response), ...pendingContext].filter(Boolean) as string[];
     pendingContext = [];
@@ -244,8 +277,38 @@ export default function (pi: ExtensionAPI) {
   // ObjectCommandResult and masks anything past ~448 bytes), so recovery loops
   // instead of terminating — and registering this tool disabled the proxy's
   // server-side retrieve loop, so nothing else would strip it.
+  // A shrink hands the model a ccr:// handle plus an instruction to call
+  // caveman_retrieve, so it is only ever compression when this session can
+  // actually make that call. `pi --tools read,bash` and a subagent with its own
+  // `tools:` list both replace the active set, dropping caveman_retrieve out of
+  // it — and the model then sees a placeholder it has no tool to redeem, which
+  // loses the original output rather than compressing it (issue #1211).
+  //
+  // This is the same rule the proxy enforces for every other host in
+  // mcpRecoveryAvailable ("compression must never outrun recovery"); this
+  // extension is the one path that shrinks in-process, so the proxy's body
+  // inspection never sees these results and it has to check for itself. The
+  // session_start gate above is not enough: it proves the MACHINE published MCP
+  // recovery, not that THIS session declares the tool to the model.
+  //
+  // Checked per result, not cached: setActiveTools() can change the set mid-
+  // session. caveman_retrieve registers with the default `direct` exposure,
+  // which Pi declares to the model and makes callable only WHILE ACTIVE, so
+  // active-set membership is exactly callability for this tool (a codemode or
+  // deferred tool would stay callable while inactive; this one is neither).
+  //
+  // A host that cannot answer fails CLOSED. Skipping a shrink costs this turn's
+  // compression; shrinking without recovery destroys the user's tool output.
+  const recoveryCallable = (): boolean => {
+    try {
+      return typeof pi.getActiveTools === "function" && pi.getActiveTools().includes(RECOVERY_TOOL);
+    } catch {
+      return false;
+    }
+  };
+
   pi.on("tool_result", GUARD_tool_result((event: Parameters<typeof shrinkToolResult>[2]) =>
-    event.toolName === RECOVERY_TOOL ? undefined : shrinkToolResult(bridge, sessionId, event)));
+    event.toolName === RECOVERY_TOOL || !recoveryCallable() ? undefined : shrinkToolResult(bridge, sessionId, event, recovery)));
 
   pi.on("session_before_compact", GUARD_session_before_compact(() => { void bridge.call("PreCompact", { session_id: sessionId }); }));
 
@@ -255,9 +318,9 @@ export default function (pi: ExtensionAPI) {
     if (context) coreContext = context;
   }));
 
-  pi.on("session_shutdown", GUARD_session_shutdown(async () => {
+  pi.on("session_shutdown", GUARD_session_shutdown(async (_event: unknown, ctx: ExtensionContext) => {
     await bridge.call("SessionEnd", { session_id: sessionId });
-    router?.closeGate();
+    await router?.closeGate(ctx);
     recovery.dispose();
   }));
 }

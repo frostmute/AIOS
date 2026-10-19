@@ -9,7 +9,6 @@ Choose either one or install both.
 |---|---|
 | Skill installer | Node.js 18 |
 | `@caveman-ai/cli` | Node.js 22.13 |
-| `@caveman-ai/agent` | Node.js 22.19 |
 | Source build | Go version in [`go.mod`](../../go.mod), Node.js, and pnpm |
 | Browser extension development | Node.js plus pinned Playwright dependencies |
 
@@ -158,17 +157,26 @@ GitHub installer is idempotent for installer-owned files.
 
 ## Uninstall
 
-Remove installer-managed skill integrations:
+Remove installer-managed skill integrations **and** native agent routing. Order
+matters: this step shells out to `caveman disable --all`, so it needs the CLI
+still installed.
 
 ```bash
 npx -y github:JuliusBrussee/caveman -- --uninstall
 ```
 
-Remove global CLI through npm:
+Then remove global CLI through npm:
 
 ```bash
 npm uninstall -g @caveman-ai/cli
 ```
+
+Reversed, the native route survives — for Claude Code that leaves
+`ANTHROPIC_BASE_URL` and `_CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL` in
+`~/.claude/settings.json` and Remote Control unavailable (see
+[agent wrapping](agent-wrapping.md)). The installer names any agent still routed
+when it finds one; recover with `caveman disable --all` after reinstalling the
+CLI, or delete those two keys by hand.
 
 These commands do not delete local usage, CCR, or account state. Review
 [`SECURITY.md`](../../SECURITY.md#local-storage) before deleting
@@ -178,6 +186,6 @@ These commands do not delete local usage, CCR, or account state. Review
 
 PowerShell 5.1+ can run root installer shim. Skills CLI may need
 `--copy` when symlink creation is unavailable. Native Windows supports local
-runtime binaries; Agent SDK tools requiring OS-level network isolation should
-run in WSL2. See [Windows fallback](../install-windows.md) for manual plugin
+runtime binaries; tools that need OS-level network isolation should run in
+WSL2. See [Windows fallback](../install-windows.md) for manual plugin
 recovery.

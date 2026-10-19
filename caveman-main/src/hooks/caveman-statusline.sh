@@ -56,39 +56,25 @@ fi
 MODE=$(head -c 64 "$FLAG" 2>/dev/null | tr -d '\n\r' | tr '[:upper:]' '[:lower:]')
 MODE=$(printf '%s' "$MODE" | tr -cd 'a-z0-9-')
 
-# Whitelist. Anything else → render nothing rather than echo attacker bytes.
-case "$MODE" in
-  off|lite|full|ultra|wenyan-lite|wenyan|wenyan-full|wenyan-ultra|commit|review|compress) ;;
-  *) exit 0 ;;
-esac
-
 # Durable off: caveman is deactivated for this session. Render nothing at all,
 # matching what an absent flag does — never "[CAVEMAN:OFF]", which would read
 # as a caveman mode rather than the absence of one.
 [ "$MODE" = "off" ] && exit 0
 
-if [ -z "$MODE" ] || [ "$MODE" = "full" ]; then
-  printf '\033[38;5;172m[CAVEMAN]\033[0m'
-else
-  SUFFIX=$(printf '%s' "$MODE" | tr '[:lower:]' '[:upper:]')
-  printf '\033[38;5;172m[CAVEMAN:%s]\033[0m' "$SUFFIX"
-fi
+# Whitelist and badge map in one. Pre-three-skill level names (lite, full,
+# ultra, wenyan*) still sit in older session files and mirrors; they render
+# as the skill they became. Anything else → render nothing rather than echo
+# attacker bytes.
+case "$MODE" in
+  caveman|lite|full) BADGE="CAVEMAN" ;;
+  ultracave|ultra) BADGE="ULTRACAVE" ;;
+  megacave|wenyan|wenyan-lite|wenyan-full|wenyan-ultra) BADGE="MEGACAVE" ;;
+  commit|review|compress) BADGE="CAVEMAN:$(printf '%s' "$MODE" | tr '[:lower:]' '[:upper:]')" ;;
+  *) exit 0 ;;
+esac
 
-# Savings suffix: on by default. Opt out via CAVEMAN_STATUSLINE_SAVINGS=0.
-# Reads a pre-rendered string written by caveman-stats.js so we don't shell out
-# to node on every keystroke. Refuses symlinks and strips control bytes —
-# same hardening as the flag file (a local attacker could plant a file with
-# ANSI escape codes otherwise). Until /caveman-stats has run at least once,
-# the suffix file is absent and nothing is rendered — so the default is safe
-# for fresh installs (no fake number, no crash).
-if [ "${CAVEMAN_STATUSLINE_SAVINGS:-1}" != "0" ]; then
-  SAVINGS_FILE="$CFG/.caveman-statusline-suffix"
-  if [ -f "$SAVINGS_FILE" ] && [ ! -L "$SAVINGS_FILE" ]; then
-    SAVINGS=$(head -c 64 "$SAVINGS_FILE" 2>/dev/null | tr -d '\000-\037')
-    [ -n "$SAVINGS" ] && printf ' \033[38;5;172m%s\033[0m' "$SAVINGS"
-  fi
-fi
+printf '\033[38;5;172m[%s]\033[0m' "$BADGE"
 
-# An empty suffix file leaves the last [ -n ] test as the script's exit status
-# (1), and Claude Code hides the whole status bar on non-zero exit (#711).
+# Historical numeric savings suffixes are not measurements. Ignore them,
+# including files written by older stats scripts before this update.
 exit 0

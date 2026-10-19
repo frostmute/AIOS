@@ -438,3 +438,149 @@ func equalFrozenComponents(first, second [][]byte) bool {
 	}
 	return true
 }
+
+// TestFrozenPrefixComponentsIgnoreCacheControlPlacement pins #1094: Claude Code
+// moves its cache_control marker forward every turn, so the message frozen on
+// turn N arrives on turn N+1 with the marker gone. Its component must hash the
+// same both times, or every turn diverges at the newest frozen message.
+func TestFrozenPrefixComponentsIgnoreCacheControlPlacement(t *testing.T) {
+	adapter := Adapter{}
+	meta := providers.RequestMetadata{Provider: "anthropic", Endpoint: "/v1/messages"}
+	marked := func(text string) string {
+		return `{"type":"text","text":"` + text + `","cache_control":{"type":"ephemeral"}}`
+	}
+	plain := func(text string) string { return `{"type":"text","text":"` + text + `"}` }
+	head := `{"model":"claude-sonnet-4-6","system":[` + marked("system") + `],` +
+		`"tools":[{"name":"Read","input_schema":{"type":"object"},"cache_control":{"type":"ephemeral"}}],"messages":[`
+	turn1 := strings.Repeat("turn one ", 40)
+	turn2 := strings.Repeat("turn two ", 40)
+	// Turn N: turn1 is marked and frozen; turn2 is marked but newest, so live.
+	turnN := []byte(head +
+		`{"role":"user","content":[` + marked(turn1) + `]},` +
+		`{"role":"assistant","content":[` + plain("answer one") + `]},` +
+		`{"role":"user","content":[` + marked(turn2) + `]}]}`)
+	// Turn N+1: the marker left turn1 and sits on turn2 and the newest message.
+	turnN1 := []byte(head +
+		`{"role":"user","content":[` + plain(turn1) + `]},` +
+		`{"role":"assistant","content":[` + plain("answer one") + `]},` +
+		`{"role":"user","content":[` + marked(turn2) + `]},` +
+		`{"role":"assistant","content":[` + plain("answer two") + `]},` +
+		`{"role":"user","content":[` + marked("turn three") + `]}]}`)
+	first, ok := adapter.FrozenPrefixComponents(turnN, meta)
+	if !ok || len(first) != 5 {
+		t.Fatalf("turn N frozen components: ok=%v n=%d, want literal+system+tools+2 messages", ok, len(first))
+	}
+	second, ok := adapter.FrozenPrefixComponents(turnN1, meta)
+	if !ok || len(second) != 7 {
+		t.Fatalf("turn N+1 frozen components: ok=%v n=%d, want 7", ok, len(second))
+	}
+	for i := range first {
+		if !bytes.Equal(first[i], second[i]) {
+			t.Fatalf("component %d changed between turns although only the cache_control marker moved", i)
+		}
+	}
+	for i, component := range second {
+		if bytes.Contains(component, []byte("cache_control")) {
+			t.Fatalf("component %d still carries a cache_control marker", i)
+		}
+	}
+	// The marker may also move between elements of the system and tools arrays.
+	systemTools := func(system, tools string) []byte {
+		return []byte(`{"model":"claude-sonnet-4-6","system":[` + system + `],"tools":[` + tools + `],"messages":[` +
+			`{"role":"user","content":[` + plain("hello") + `]}]}`)
+	}
+	tool := func(name, marker string) string {
+		return `{"name":"` + name + `","input_schema":{"type":"object"}` + marker + `}`
+	}
+	before, ok := adapter.FrozenPrefixComponents(systemTools(marked("one")+","+plain("two"), tool("A", `,"cache_control":{"type":"ephemeral"}`)+","+tool("B", "")), meta)
+	after, ok2 := adapter.FrozenPrefixComponents(systemTools(plain("one")+","+marked("two"), tool("A", "")+","+tool("B", `,"cache_control":{"type":"ephemeral"}`)), meta)
+	if !ok || !ok2 || !equalFrozenComponents(before, after) {
+		t.Fatal("a marker moving within the system or tools array changed the frozen prefix evidence")
+	}
+}
+
+func TestStripCacheControl(t *testing.T) {
+	cases := map[string]string{
+		// last member, first member, only member
+		`[{"type":"text","text":"a","cache_control":{"type":"ephemeral"}}]`: `[{"type":"text","text":"a"}]`,
+		`[{"cache_control":{"type":"ephemeral"},"type":"text","text":"a"}]`: `[{"type":"text","text":"a"}]`,
+		`[{"cache_control":{"type":"ephemeral"}}]`:                          `[{}]`,
+		// message object: only its content blocks are touched
+		`{"role":"user","content":[{"type":"text","text":"a","cache_control":{"type":"ephemeral","ttl":"1h"}},{"type":"text","text":"b"}]}`: `{"role":"user","content":[{"type":"text","text":"a"},{"type":"text","text":"b"}]}`,
+		// untouched: string content, a string system, the key only inside prose
+		`{"role":"user","content":"plain"}`:                        `{"role":"user","content":"plain"}`,
+		`"system prose naming \"cache_control\""`:                  `"system prose naming \"cache_control\""`,
+		`[{"type":"text","text":"talks about \"cache_control\""}]`: `[{"type":"text","text":"talks about \"cache_control\""}]`,
+	}
+	for in, want := range cases {
+		if got := string(stripCacheControl([]byte(in))); got != want {
+			t.Errorf("stripCacheControl(%s)\n got  %s\n want %s", in, got, want)
+		}
+	}
+	for _, untouched := range [][]byte{
+		[]byte(`[{"type":"text","text":"a"}]`),
+		[]byte(`[{"type":"text","text":"talks about \"cache_control\""}]`),
+	} {
+		if got := stripCacheControl(untouched); &got[0] != &untouched[0] {
+			t.Fatalf("a value with no marker member must be returned as the same slice: %s", untouched)
+		}
+	}
+}
+
+// TestCachedPrefixComponentsCoverTheMarkedMessage pins the difference from
+// FrozenPrefixComponents: the provider caches THROUGH the last marked message,
+// which is the live one Claude Code marks every turn. The next request has to
+// reproduce that message's forwarded bytes too, so it must be in the range.
+func TestCachedPrefixComponentsCoverTheMarkedMessage(t *testing.T) {
+	marked := func(text string) string {
+		return `{"type":"text","text":"` + text + `","cache_control":{"type":"ephemeral"}}`
+	}
+	plain := func(text string) string { return `{"type":"text","text":"` + text + `"}` }
+	user := func(block string) string { return `{"role":"user","content":[` + block + `]}` }
+	request := func(extra string, messages ...string) []byte {
+		return []byte(`{"model":"claude-sonnet-4-6",` + extra + `"system":[` + marked("system") + `],` +
+			`"tools":[{"name":"Read","input_schema":{"type":"object"}}],"messages":[` + strings.Join(messages, ",") + `]}`)
+	}
+	answer := `{"role":"assistant","content":[` + plain("answer") + `]}`
+
+	// Turn N marks its newest message; turn N+1 moves the marker one turn on.
+	turnN := request("", user(plain("one")), answer, user(marked("two")))
+	turnN1 := request("", user(plain("one")), answer, user(plain("two")), answer, user(marked("three")))
+	first, cached, ok := CachedPrefixComponents(turnN)
+	if !ok || cached != 5 || len(first) != 5 {
+		t.Fatalf("turn N: ok=%v cached=%d n=%d, want system+tools+3 messages all cached", ok, cached, len(first))
+	}
+	second, cached1, ok := CachedPrefixComponents(turnN1)
+	if !ok || cached1 != 7 || len(second) != 7 {
+		t.Fatalf("turn N+1: ok=%v cached=%d n=%d, want 7/7", ok, cached1, len(second))
+	}
+	for i := 0; i < cached; i++ {
+		if !bytes.Equal(first[i], second[i]) {
+			t.Fatalf("component %d changed although only the marker moved", i)
+		}
+	}
+
+	// An unmarked tail is sent but not cached; no marked message caches only system+tools.
+	tail := request("", user(marked("one")), answer, user(plain("two")))
+	if _, cached, ok := CachedPrefixComponents(tail); !ok || cached != 3 {
+		t.Fatalf("unmarked tail: ok=%v cached=%d, want 3", ok, cached)
+	}
+	unmarked := request("", user(plain("one")))
+	if _, cached, ok := CachedPrefixComponents(unmarked); !ok || cached != 2 {
+		t.Fatalf("no marked message: ok=%v cached=%d, want 2", ok, cached)
+	}
+	// Top-level automatic caching places the breakpoint on the last block.
+	automatic := request(`"cache_control":{"type":"ephemeral"},`, user(plain("one")), answer, user(plain("two")))
+	if _, cached, ok := CachedPrefixComponents(automatic); !ok || cached != 5 {
+		t.Fatalf("automatic caching: ok=%v cached=%d, want 5", ok, cached)
+	}
+	if _, cached, ok := CachedPrefixComponents([]byte(`{"model":"m","messages":[` + user(plain("one")) + `]}`)); !ok || cached != 0 {
+		t.Fatalf("no marker anywhere caches nothing: ok=%v cached=%d", ok, cached)
+	}
+	if _, _, ok := CachedPrefixComponents([]byte(`{"messages":"nope"}`)); ok {
+		t.Fatal("a request with no messages array has no cached prefix")
+	}
+	if _, _, ok := (Adapter{}).CachedPrefixComponents(turnN, providers.RequestMetadata{Endpoint: "/v1/messages/count_tokens"}); ok {
+		t.Fatal("count_tokens is never cached")
+	}
+}

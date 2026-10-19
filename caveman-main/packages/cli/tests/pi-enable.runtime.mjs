@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { delimiter, dirname, join } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 
@@ -31,7 +31,8 @@ function fixture() {
   const proxy = nativeStub(bin, "caveman-proxy", `if (ARGV[0] === "version" && ARGV[1] === "--json") {
   process.stdout.write('{"version":"1.0.0","capabilities":["run_state","native_runtime_v1","native_hook_bridge_v1","typed_ccr"]}\\n');
 } else if (ARGV[0] === "status") {
-  process.stdout.write('{"owner":"unknown"}\\n');
+  // A Caveman runtime answers where Pi is wired.
+  process.stdout.write('{"owner":"start"}\\n');
 } else if (ARGV[0] === "stats") {
   process.stdout.write('{}\\n');
 }
@@ -140,6 +141,49 @@ test("enable pi refuses foreign pre-existing extension", async () => {
     assert.deepEqual(readFileSync(fx.extension), foreign);
     assert.deepEqual(readFileSync(fx.settings), SETTINGS_BYTES);
     assert.equal(existsSync(join(fx.home, ".caveman", "integrations", "pi.json")), false);
+  } finally {
+    fx.cleanup();
+  }
+});
+
+// Same #1137 hole as the opencode plugin: the extension bakes the invocation
+// `enable pi` resolved (plain `pi` launches carry no wrap env), and ownership
+// was judged by the marker comment alone — so a removed nvm Node directory
+// left the bytes intact, doctor calling the install healthy, and every hook
+// call failing silently.
+test("doctor flags a pi extension whose baked invocation no longer exists and --fix re-renders it", async () => {
+  const fx = fixture();
+  try {
+    // Stand-in for ~/.nvm/versions/node/<version>/bin, first on PATH.
+    const versioned = join(fx.root, "nvm", "v26.9.0", "bin");
+    mkdirSync(versioned, { recursive: true });
+    nodeStub(versioned, "caveman", "");
+    // Windows spells the inherited key `Path`; `fx.env.PATH` would be undefined.
+    const pathKey = Object.keys(fx.env).find((key) => key.toLowerCase() === "path") ?? "PATH";
+    const env = { ...fx.env, [pathKey]: `${versioned}${delimiter}${fx.env[pathKey]}` };
+
+    const enabled = await run(["enable", "pi"], env);
+    assert.equal(enabled.code, 0, `enable pi: ${enabled.stderr}${enabled.stdout}`);
+    // Pin the shape the health check parses: if the generator stops baking the
+    // invocation into CAVEMAN_PI_HOOK_CMD, the check verifies nothing.
+    assert.match(readFileSync(fx.extension, "utf8"), /^process\.env\.CAVEMAN_PI_HOOK_CMD \?\?= ".*v26\.9\.0.*";$/m);
+    assert.equal(JSON.parse((await run(["status", "--json"], env)).stdout)
+      .native_integrations.find((row) => row.agent === "pi").state, "installed");
+
+    // The Node upgrade. The extension's bytes do not change; its target goes.
+    rmSync(dirname(versioned), { recursive: true, force: true });
+    const degraded = await run(["doctor", "pi"], fx.env);
+    assert.notEqual(degraded.code, 0, "an extension naming a missing executable must not report healthy");
+    const before = JSON.parse(degraded.stdout);
+    assert.equal(before.state, "degraded");
+    assert.equal(before.components.lifecycle_hooks, false);
+
+    const fixed = await run(["doctor", "pi", "--fix"], fx.env);
+    assert.equal(fixed.code, 0, fixed.stderr);
+    assert.equal(JSON.parse(fixed.stdout).fix.result, "repaired");
+    assert.equal(JSON.parse(fixed.stdout).state, "installed");
+    assert.doesNotMatch(readFileSync(fx.extension, "utf8"), /v26\.9\.0/);
+    assert.deepEqual(readFileSync(fx.settings), SETTINGS_BYTES);
   } finally {
     fx.cleanup();
   }
