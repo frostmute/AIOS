@@ -343,10 +343,14 @@ PROVIDER_VAR = {
     "claudecode": "OPENAI_API_KEY",
     # ChatGPT/Codex via the local codex CLI (auth is `codex login`, no API key).
     "codex": "OPENAI_API_KEY",
+    # 9router local proxy (OpenAI-compatible router at :20128).
+    "9router": "OPENAI_API_KEY",
+    "custom": "OPENAI_API_KEY",
 }
 PASSTHROUGH_KEYS = [
     "OPENROUTER_API_KEY", "ANTHROPIC_API_KEY", "OPENAI_API_KEY",
     "GEMINI_API_KEY", "GOOGLE_API_KEY",
+    "OPENAI_BASE_URL", "ANTHROPIC_BASE_URL", "AIOS_LLM_BASE_URL",
 ]
 CHANNEL_KEYS = ["TELEGRAM_BOT_TOKEN", "DISCORD_BOT_TOKEN", "SLACK_BOT_TOKEN", "SLACK_APP_TOKEN"]
 
@@ -358,6 +362,14 @@ def provider_env(cfg: dict, secrets: dict) -> tuple[dict, str, str]:
     env = {}
     if key:
         env[var] = key
+    base_url = secrets.get("AIOS_LLM_BASE_URL") or secrets.get("OPENAI_BASE_URL") or (
+        "http://127.0.0.1:20128/v1" if provider == "9router" else ""
+    )
+    if base_url:
+        env["OPENAI_BASE_URL"] = base_url
+        env["AIOS_LLM_BASE_URL"] = base_url
+        if key and "OPENAI_API_KEY" not in env:
+            env["OPENAI_API_KEY"] = key
     for k in PASSTHROUGH_KEYS:
         if secrets.get(k):
             env[k] = secrets[k]
@@ -393,6 +405,7 @@ def service_specs(cfg: dict) -> dict:
             "port": port,
             "health": cfg_get(cfg, "health.hermes", f"http://{host}:{port}/"),
             "tool": "uv",
+            "env": hermes_env(),
         }
         if cfg_get(cfg, "services.hermes.gateway", False):
             specs["hermes-gateway"] = {
@@ -402,6 +415,7 @@ def service_specs(cfg: dict) -> dict:
                 "port": None,
                 "health": None,
                 "tool": "uv",
+                "env": hermes_env(),
             }
     if cl:
         port = int(cfg_get(cfg, "services.openclaw.port", 18789))
@@ -532,13 +546,18 @@ def service_specs(cfg: dict) -> dict:
 START_ORDER = ["opencode", "hermes", "hermes-gateway", "hermes-proxy", "openclaw",
                "openclaw-proxy", "crewai", "claudecode", "codex", "paperclip", "hub"]
 
+def hermes_env() -> dict:
+    """Isolate hermes in an aios-managed state dir (non-destructive)."""
+    d = STATE / "hermes"
+    d.mkdir(parents=True, exist_ok=True)
+    return {"HERMES_HOME": str(d)}
+
 
 def openclaw_env() -> dict:
     """Isolate openclaw in an aios-managed state dir (non-destructive)."""
     d = STATE / "openclaw"
     d.mkdir(parents=True, exist_ok=True)
     return {"OPENCLAW_STATE_DIR": str(d)}
-
 
 def interconnect_env(cfg: dict) -> dict:
     """Peer + hub URLs injected into every service so agents can reach each other."""
@@ -957,11 +976,12 @@ def _wizard_env(args):
         say(f"    {C.CYN}4{C.R}  Anthropic API key")
         say(f"    {C.CYN}5{C.R}  OpenAI API key")
         say(f"    {C.CYN}6{C.R}  Google Gemini API key")
+        say(f"    {C.CYN}7{C.R}  9router proxy                {C.GRY}— local 9router at http://127.0.0.1:20128/v1{C.R}")
         say(f"    {C.GRY}s{C.R}  skip for now")
-        choice = input(f"  Choice [1-6/s] ({data['AIOS_LLM_PROVIDER']}): ").strip().lower()
+        choice = input(f"  Choice [1-7/s] ({data['AIOS_LLM_PROVIDER']}): ").strip().lower()
 
         by_num = {"1": "claude", "2": "codex", "3": "openrouter", "4": "anthropic",
-                  "5": "openai", "6": "gemini", "s": "skip"}
+                  "5": "openai", "6": "gemini", "7": "9router", "s": "skip"}
         prov = by_num.get(choice, choice or data["AIOS_LLM_PROVIDER"])
 
         if prov in ("skip", "none", "s"):
@@ -1009,6 +1029,17 @@ def _wizard_env(args):
             else:
                 ok(f"found the codex CLI ({cx})")
                 say(f"  {C.GRY}If it isn't logged in yet, run `codex login`.{C.R}")
+        elif prov in ("9router", "router"):
+            data["AIOS_LLM_PROVIDER"] = "9router"
+            data["AIOS_LLM_BASE_URL"] = "http://127.0.0.1:20128/v1"
+            data["OPENAI_BASE_URL"] = "http://127.0.0.1:20128/v1"
+            key = input(f"  API key ({mask(data.get('AIOS_LLM_API_KEY', ''))}): ").strip()
+            if key:
+                data["AIOS_LLM_API_KEY"] = key
+                data["OPENAI_API_KEY"] = key
+            model = input(f"  Default model ({data['AIOS_DEFAULT_MODEL']}): ").strip()
+            data["AIOS_DEFAULT_MODEL"] = model or "ag/claude-sonnet-4-6"
+            ok("using 9router proxy (http://127.0.0.1:20128/v1)")
         else:
             data["AIOS_LLM_PROVIDER"] = prov
             data.pop("AIOS_LLM_BASE_URL", None)  # don't leave a stale claude-code URL
@@ -1221,6 +1252,9 @@ def render_native(cfg: dict, secrets: dict):
     RENDERED.mkdir(parents=True, exist_ok=True)
     penv, provider, var = provider_env(cfg, secrets)
     model = secrets.get("AIOS_DEFAULT_MODEL") or cfg_get(cfg, "model.default", "anthropic/claude-opus-4.6")
+    base_url = secrets.get("AIOS_LLM_BASE_URL") or secrets.get("OPENAI_BASE_URL") or (
+        "http://127.0.0.1:20128/v1" if provider == "9router" else ""
+    )
     rendered = []
 
     # hermes: .env + cli-config.yaml (model.default)
@@ -1232,8 +1266,21 @@ def render_native(cfg: dict, secrets: dict):
         for k in PASSTHROUGH_KEYS:
             if secrets.get(k):
                 henv[k] = secrets[k]
+        if base_url:
+            henv["OPENAI_BASE_URL"] = base_url
         _backup_and_write(hm / ".env", lambda p: write_env(p, henv, "rendered by aios — edit ../../.env instead"))
-        (hm / "cli-config.yaml").write_text(f'model:\n  default: "{model}"\n', encoding="utf-8")
+        key = secrets.get(var) or secrets.get("AIOS_LLM_API_KEY", "")
+        if base_url:
+            cfg_text = (
+                f'model:\n  default: "{model}"\n  provider: custom\n  base_url: "{base_url}"\n  api_key: "{key}"\n'
+            )
+        else:
+            cfg_text = f'model:\n  default: "{model}"\n'
+        (hm / "cli-config.yaml").write_text(cfg_text, encoding="utf-8")
+        hd = STATE / "hermes"
+        hd.mkdir(parents=True, exist_ok=True)
+        write_env(hd / ".env", henv, "rendered by aios")
+        (hd / "config.yaml").write_text(cfg_text, encoding="utf-8")
         rendered.append(f"hermes: .env ({var}), cli-config.yaml (model={model})")
 
     # openclaw: .env (token + provider + channels)
@@ -1248,15 +1295,32 @@ def render_native(cfg: dict, secrets: dict):
         for k in PASSTHROUGH_KEYS + CHANNEL_KEYS:
             if secrets.get(k):
                 cenv[k] = secrets[k]
+        if base_url:
+            cenv["OPENAI_BASE_URL"] = base_url
         _backup_and_write(cl / ".env", lambda p: write_env(p, cenv, "rendered by aios — edit ../../.env instead"))
-        # Minimal gateway config in the isolated state dir so a fresh openclaw
-        # starts on loopback without the interactive `openclaw setup`.
         sd = STATE / "openclaw"
         sd.mkdir(parents=True, exist_ok=True)
-        (sd / "openclaw.json").write_text(
-            json.dumps({"gateway": {"mode": "local"}}, indent=2), encoding="utf-8")
+        key = secrets.get(var) or secrets.get("AIOS_LLM_API_KEY", "")
+        cfg_obj = {"gateway": {"mode": "local"}}
+        if provider == "9router" or "20128" in base_url:
+            cfg_obj["agents"] = {
+                "defaults": {
+                    "model": {"primary": f"9router/{model}"},
+                    "models": {f"9router/{model}": {}}
+                }
+            }
+            cfg_obj["models"] = {
+                "providers": {
+                    "9router": {
+                        "baseUrl": base_url or "http://127.0.0.1:20128/v1",
+                        "apiKey": key,
+                        "api": "openai-completions",
+                        "models": [{"id": model, "name": model}]
+                    }
+                }
+            }
+        (sd / "openclaw.json").write_text(json.dumps(cfg_obj, indent=2), encoding="utf-8")
         rendered.append(f"openclaw: .env ({var}, {sum(1 for k in CHANNEL_KEYS if secrets.get(k))} channel token(s)) + state/openclaw.json (mode=local)")
-
     # opencode: provider keys are injected at start via env (no file written,
     # so we never risk breaking opencode's config schema). Record intent.
     (RENDERED / "opencode.env").write_text(
@@ -1292,6 +1356,7 @@ def mount_lifeos(cfg: dict):
     targets = [
         Path.home() / ".openclaw" / "skills" / "lifeos",
         Path.home() / ".hermes" / "skills" / "lifeos",
+        STATE / "hermes" / "skills" / "lifeos",
         STATE / "skills" / "lifeos",
     ]
     for t in targets:
@@ -1315,7 +1380,7 @@ def mount_aios_skills(cfg: dict):
         return
     names = [p.name for p in src.iterdir() if p.is_dir()]
     targets = [Path.home() / ".openclaw" / "skills", Path.home() / ".hermes" / "skills",
-               STATE / "skills"]
+               STATE / "hermes" / "skills", STATE / "skills"]
     for t in targets:
         for name in names:
             try:
@@ -1343,7 +1408,7 @@ def mount_agent_modes(cfg: dict):
         return
     head("Mounting agent-mode skills (caveman · ponytail)")
     targets = [Path.home() / ".openclaw" / "skills", Path.home() / ".hermes" / "skills",
-               STATE / "skills"]
+               STATE / "hermes" / "skills", STATE / "skills"]
     for skdir in skdirs:
         for sk in sorted(p for p in skdir.iterdir() if p.is_dir() and (p / "SKILL.md").exists()):
             names.append(sk.name)

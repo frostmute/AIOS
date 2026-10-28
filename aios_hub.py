@@ -310,7 +310,8 @@ def llm_base() -> str:
         "openai": "https://api.openai.com/v1",
         "gemini": "https://generativelanguage.googleapis.com/v1beta/openai",
         "claudecode": CLAUDECODE + "/v1",  # Claude Pro/Max via claude-code-api
-    }.get(prov, "https://openrouter.ai/api/v1")
+        "9router": "http://127.0.0.1:20128/v1",
+    }.get(prov, "http://127.0.0.1:20128/v1" if prov == "9router" else "https://openrouter.ai/api/v1")
 
 
 def _up(url: str) -> bool:
@@ -335,7 +336,7 @@ def llm_chat(messages: list, system: str | None = None) -> str:
         else:
             return "⚠️ No model API key set. Run `aios setup --force` and enter your key, then restart."
     msgs = ([{"role": "system", "content": system}] if system else []) + messages
-    body = json.dumps({"model": model, "messages": msgs}).encode()
+    body = json.dumps({"model": model, "messages": msgs, "stream": False}).encode()
     req = urllib.request.Request(
         base + "/chat/completions", data=body, method="POST",
         headers={"Content-Type": "application/json", "Authorization": f"Bearer {key}",

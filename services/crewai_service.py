@@ -31,6 +31,10 @@ def litellm_model() -> str:
         return "openrouter/" + model
     if prov == "anthropic" and not model.startswith("anthropic/"):
         return "anthropic/" + model
+    if prov in ("claudecode", "codex"):
+        return "openai/" + model
+    if prov == "9router" and not model.startswith("openai/"):
+        return "openai/" + model
     if prov == "openai" and "/" not in model:
         return model
     return model
