@@ -15,20 +15,31 @@ aios.config.yaml
 hermes-agent-main/**/cli-config.yaml
 
 # ── Dependencies (reinstalled by `aios setup`) ──
+**/node_modules
 **/node_modules/
+**/.venv
 **/.venv/
+**/venv
 **/venv/
 **/__pycache__/
 *.py[cod]
+**/.pnpm-store
 **/.pnpm-store/
+**/.pnpm
 **/.pnpm/
 
 # ── Build outputs (rebuilt by `aios setup`) ──
+opencode-dev/**/dist
 opencode-dev/**/dist/
+openclaw-main/**/dist
 openclaw-main/**/dist/
+openclaw-main/**/dist-runtime
 openclaw-main/**/dist-runtime/
+openclaw-os-main/**/dist
 openclaw-os-main/**/dist/
+openclaw-os-main/**/.next
 openclaw-os-main/**/.next/
+openclaw-os-main/**/out
 openclaw-os-main/**/out/
 **/.turbo/
 **/*.tsbuildinfo
@@ -41,3 +52,4 @@ Thumbs.db
 **/build/
 claude-code-api-main/.env
 claude-code-api-main/.env
+.superset/config.local.json
