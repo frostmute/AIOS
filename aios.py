@@ -1038,7 +1038,7 @@ def _wizard_env(args):
                 data["AIOS_LLM_API_KEY"] = key
                 data["OPENAI_API_KEY"] = key
             model = input(f"  Default model ({data['AIOS_DEFAULT_MODEL']}): ").strip()
-            data["AIOS_DEFAULT_MODEL"] = model or "ag/claude-sonnet-4-6"
+            data["AIOS_DEFAULT_MODEL"] = model or "ag/gemini-3.8-flash"
             ok("using 9router proxy (http://127.0.0.1:20128/v1)")
         else:
             data["AIOS_LLM_PROVIDER"] = prov
